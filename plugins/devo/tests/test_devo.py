@@ -1,5 +1,5 @@
 """Offline tests for plugins/devo/skills/devo/scripts/devo.py. Run: python3 -m unittest discover plugins/devo/tests"""
-import contextlib, io, json, os, sys, tempfile, unittest
+import contextlib, io, json, os, re, sys, tempfile, unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "skills", "devo", "scripts"))
@@ -838,11 +838,24 @@ class WriteSurfaceTests(unittest.TestCase):
     def test_only_expected_writes(self):
         with open(devo.__file__) as f:
             src = f.read()
-        for verb in ('"PUT"', '"DELETE"', "updateStatus", "/tags", "alertDefinitions/status"):
+        for verb in ("updateStatus", "/tags", "alertDefinitions/status"):
             self.assertNotIn(verb, src)
         # POSTs: the Query API and comments/add (behind --confirm)
         self.assertEqual(src.count('http_open("POST"'), 2)
         self.assertIn('"comments/add"', src)
+        # Activeboard writes only through board_call, one call site per verb, each behind --confirm
+        for verb, n in (('"PUT"', 1), ('"PATCH"', 1), ('"DELETE"', 1), ('board_call(cfg, "POST"', 2)):
+            self.assertEqual(src.count(verb), n, verb)
+        self.assertNotIn('http_open("PUT"', src)
+        self.assertNotIn('http_open("DELETE"', src)
+        writers = ("cmd_board_push", "cmd_board_set", "cmd_board_clone", "cmd_board_delete")
+        for name in writers:
+            body = src[src.index(f"def {name}("):]
+            body = body[:body.index("\ndef ", 1)]
+            self.assertLess(body.index("if not a.confirm"), body.index("board_call(cfg, \"" ), name)
+        for m in re.finditer(r'board_call\(cfg, "(POST|PUT|PATCH|DELETE)"', src):
+            owner = src.rfind("\ndef ", 0, m.start())
+            self.assertIn(src[owner + 5:src.index("(", owner)], writers)
 
     def test_cloudflare_hint_only_for_1010(self):
         e = devo.api_error(504, '{"title":"Error 504: Gateway time-out","detail":"The origin web server '
@@ -1368,6 +1381,187 @@ class TeamsTests(unittest.TestCase):
             self.assertIn("matches 2 accounts", err)
             code, _, err, _ = run_routed(["teams", "me", "--out", os.path.join(devo.SKILL_DIR, "t.json")], route)
             self.assertEqual(code, 1)
+
+
+def board_settings(children=None, layout=None):
+    children = children if children is not None else {
+        "Table0": {"name": "Table0", "type": "widget", "subtype": "Table",
+                   "datasource": 'query(from siem.logtrust.web.activity where eq(method, "POST"))',
+                   "date": {}, "settings": {}, "extra": {}, "children": None, "version": 3}}
+    if layout is None:
+        layout = {k: {"x": 0, "y": 0, "w": 6, "h": 10, "i": k, "moved": False, "static": False} for k in children}
+    return {"type": "container", "subtype": "Grid", "date": {"realTime": False, "from": "now() - 15m", "to": "now()"},
+            "settings": {"layout": layout, "header": False}, "extra": {}, "children": children, "version": 3}
+
+
+BOARD = {"id": 34567, "name": "Test board", "description": "", "updateDate": 1790611330000, "isPrivate": True,
+         "isDefault": False, "favorite": False, "editable": True, "tags": ["soc"],
+         "owner": {"username": "jsmith@example.com"}, "settings": board_settings()}
+
+
+class BoardTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="devo-board-test-")
+
+    def write(self, name, obj):
+        p = os.path.join(self.tmp, name)
+        with open(p, "w") as f:
+            json.dump(obj, f)
+        return p
+
+    def test_board_query_extraction(self):
+        q = devo.board_query
+        self.assertEqual(q("query(from t where eq(a, \"x)\"))"), 'from t where eq(a, "x)")')
+        self.assertEqual(q("take(query(from t select a), 5)"), "from t select a")
+        self.assertIsNone(q("query(Input0.value)"))
+        self.assertIsNone(q("query(from t where eq(a, 1)"))  # unbalanced
+        self.assertIsNone(q(None))
+        # boards built in the UI store plain LINQ [verified]
+        self.assertEqual(q(" from t group by a select count() as n "), "from t group by a select count() as n")
+
+    def test_lint(self):
+        self.assertEqual(devo.board_lint(board_settings()), ([], []))
+        s = board_settings(layout={"Other": {"x": 0, "y": 0, "w": 6, "h": 4, "i": "Wrong"}})
+        errs, warns = devo.board_lint(s)
+        self.assertTrue(any("Table0: no layout entry" in e for e in errs))
+        self.assertTrue(any("layout.i" in e for e in errs))
+        self.assertTrue(any("stale entry" in w for w in warns))
+        child = dict(BOARD["settings"]["children"]["Table0"], datasource=" ", name="Requests by method")
+        errs, warns = devo.board_lint(board_settings({"Table0": child}))
+        self.assertTrue(any("no datasource" in e for e in errs))
+        self.assertFalse(any("name" in w for w in warns))  # name is the display title, not the id
+        child["datasource"] = "from t group every $*Select0.value"
+        errs, _ = devo.board_lint(board_settings({"Table0": child}))
+        self.assertTrue(any("no element Select0" in e for e in errs))
+
+    def test_fill_inputs(self):
+        linq, missing = devo.board_fill_inputs('from t where method=$Input0.value group every $*Sel.value', {"Input0": "GET"})
+        self.assertEqual(missing, {"Sel"})
+        self.assertIn('method="GET"', linq)
+        linq, _ = devo.board_fill_inputs("x > $Input0.value every $*Sel.value", {"Input0": "5", "Sel": "1h"})
+        self.assertEqual(linq, "x > 5 every 1h")
+
+    def test_board_new_layout_and_wrapping(self):
+        spec = self.write("spec.json", {"name": "N", "widgets": [
+            {"type": "Table", "query": "from a select b", "title": "B"}, {"type": "Line", "query": "query(from a)", "w": 8},
+            {"id": "Select0", "type": "Input", "w": 3}]})
+        out = os.path.join(self.tmp, "b.json")
+        code, _, err, reqs = run_cli(["board-new", spec, "--out", out], [])
+        self.assertEqual((code, reqs), (0, []))
+        with open(out) as f:
+            doc = json.load(f)
+        s = doc["settings"]
+        self.assertEqual(s["children"]["Table0"]["datasource"], "from a select b")
+        self.assertEqual(s["children"]["Table0"]["name"], "B")
+        self.assertEqual(s["children"]["Line0"]["datasource"], "query(from a)")
+        lay = s["settings"]["layout"]
+        self.assertEqual((lay["Table0"]["x"], lay["Table0"]["y"]), (0, 0))
+        self.assertEqual((lay["Line0"]["x"], lay["Line0"]["y"]), (0, 10))  # 6 + 8 > 12: next row
+        self.assertEqual((lay["Select0"]["x"], lay["Select0"]["y"]), (8, 10))
+        self.assertEqual(devo.board_lint(s)[0], [])
+        self.assertEqual(os.stat(out).st_mode & 0o077, 0)
+
+    def test_list_uses_activeboards_api_and_hides_token(self):
+        code, out, err, reqs = run_cli(["boards", "--grep", "soc"], [FakeResp(json.dumps([BOARD]))])
+        self.assertEqual(code, 0)
+        self.assertEqual(reqs[0].full_url, "https://api-eu.devo.com/activeboards/v2/activeboards")
+        self.assertEqual(reqs[0].get_method(), "GET")
+        self.assertEqual(reqs[0].get_header("Standalonetoken"), CFG["token"])
+        self.assertIn("34567", out)
+        self.assertIn("[P]", out)
+        self.assertNotIn(CFG["token"], out + err)
+
+    def test_board_export_roundtrip(self):
+        out = os.path.join(self.tmp, "export.json")
+        code, text, _, _ = run_cli(["board", "34567", "--out", out], [FakeResp(json.dumps(BOARD))])
+        self.assertEqual(code, 0)
+        self.assertIn('eq(method, "POST")', text)
+        with open(out) as f:
+            doc = json.load(f)
+        self.assertEqual(doc["exported_from"], {"id": 34567, "updateDate": 1790611330000})
+        self.assertNotIn("owner", doc)
+
+    def test_bad_id_rejected_before_any_request(self):
+        code, _, err, reqs = run_cli(["board", "12/../x"], [])
+        self.assertEqual((code, reqs), (1, []))
+
+    def test_push_preview_sends_nothing(self):
+        f = self.write("b.json", {"name": "New", "settings": board_settings()})
+        code, out, err, reqs = run_cli(["board-push", f], [])
+        self.assertEqual((code, reqs), (0, []))
+        self.assertIn("POST https://api-eu.devo.com/activeboards/v2/activeboards", out)
+        self.assertIn("NOT SENT", err)
+
+    def test_push_refuses_lint_errors(self):
+        f = self.write("b.json", {"name": "New", "settings": board_settings(layout={})})
+        code, _, err, reqs = run_cli(["board-push", f, "--confirm"], [])
+        self.assertEqual((code, reqs), (1, []))
+        self.assertIn("no layout entry", err)
+
+    def test_push_create_confirm_verifies(self):
+        f = self.write("b.json", {"name": "New", "settings": board_settings()})
+        created = dict(BOARD, id=99, name="New")
+        code, _, err, reqs = run_cli(["board-push", f, "--confirm"],
+                                     [FakeResp(json.dumps(created)), FakeResp(json.dumps(created))])
+        self.assertEqual(code, 0, err)
+        self.assertEqual([r.get_method() for r in reqs], ["POST", "GET"])
+        self.assertEqual(json.loads(reqs[0].data)["name"], "New")
+        self.assertTrue(reqs[1].full_url.endswith("/activeboards/99"))
+        self.assertIn("created and verified", err)
+
+    def test_push_update_backs_up_and_warns_on_concurrent_edit(self):
+        f = self.write("b.json", {"name": "Test board", "settings": board_settings(),
+                                  "exported_from": {"id": 34567, "updateDate": 1}})
+        code, out, err, reqs = run_cli(["board-push", f, "--id", "34567"], [FakeResp(json.dumps(BOARD))])
+        self.assertEqual([r.get_method() for r in reqs], ["GET"])
+        self.assertIn("changed since the export", err)
+        code, out, err, reqs = run_cli(["board-push", f, "--id", "34567", "--confirm"],
+                                       [FakeResp(json.dumps(BOARD)) for _ in range(3)])
+        self.assertEqual(code, 0, err)
+        self.assertEqual([r.get_method() for r in reqs], ["GET", "PUT", "GET"])
+        backup = re.search(r"backup of the current board: (\S+)", err).group(1)
+        self.assertTrue(backup.startswith(os.environ["DEVO_CACHE_DIR"]))
+        self.assertEqual(os.stat(backup).st_mode & 0o077, 0)
+        with open(backup) as fh:
+            self.assertEqual(json.load(fh)["settings"], BOARD["settings"])
+
+    def test_set_patches(self):
+        code, out, err, reqs = run_cli(["board-set", "34567", "--private", "false", "--tags", "soc, web"],
+                                       [FakeResp(json.dumps(BOARD))])
+        self.assertEqual(len(reqs), 1)
+        self.assertIn("NOT SENT", err)
+        after = dict(BOARD, isPrivate=False, tags=["soc", "web"])
+        code, out, err, reqs = run_cli(["board-set", "34567", "--private", "false", "--tags", "soc, web", "--confirm"],
+                                       [FakeResp(json.dumps(BOARD)), FakeResp(""), FakeResp(""),
+                                        FakeResp(json.dumps(after))])
+        self.assertEqual(code, 0, err)
+        patches = [(r.full_url.rsplit("/", 1)[1], json.loads(r.data)) for r in reqs if r.get_method() == "PATCH"]
+        self.assertEqual(patches, [("privacy", {"privacy": False}), ("tags", {"tags": "soc, web"})])
+
+    def test_delete_backs_up_then_verifies_gone(self):
+        code, _, err, reqs = run_cli(["board-delete", "34567", "--confirm"],
+                                     [FakeResp(json.dumps(BOARD)), FakeResp(""), http_error(404, "{}")])
+        self.assertEqual(code, 0, err)
+        self.assertEqual([r.get_method() for r in reqs], ["GET", "DELETE", "GET"])
+        self.assertIn("backup:", err)
+        self.assertIn("deleted and verified", err)
+
+    def test_check_run_executes_widget_queries(self):
+        child = dict(BOARD["settings"]["children"]["Table0"])
+        sel = {"name": "Select0", "type": "input", "subtype": "Input", "datasource": None}
+        trend = dict(child, name="Trend", datasource="query(from t group every $*Select0.value select count() as n)")
+        f = self.write("b.json", {"name": "x", "settings": board_settings({"Table0": child, "Select0": sel,
+                                                                          "Trend": trend})})
+        code, out, err, reqs = run_cli(["board-check", f, "--run"], [FakeResp(COMPACT)])
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual(json.loads(reqs[0].data)["query"],
+                         'from siem.logtrust.web.activity where eq(method, "POST")')
+        self.assertIn("ok      Table0: 2 row(s)", out)
+        self.assertIn("skip    Trend: needs --input Select0=...", out)
+        code, out, err, reqs = run_cli(["board-check", f, "--run", "--input", "Select0=1h"],
+                                       [FakeResp(COMPACT), FakeResp(COMPACT)])
+        self.assertIn("group every 1h", json.loads(reqs[1].data)["query"])
 
 
 class TimelineActorTests(unittest.TestCase):

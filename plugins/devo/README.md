@@ -1,6 +1,7 @@
 # devo
 
-Query and investigate security data in a Devo domain, and triage Devo alerts.
+Query and investigate security data in a Devo domain, triage Devo alerts, and build Devo dashboards
+(Activeboards).
 
 - `skills/devo/SKILL.md`: setup and safety rules, the command synopsis, workflow, the most common
   LINQ traps, triage steps, and how the domain cache is used. Loaded whenever the skill triggers, so
@@ -10,8 +11,10 @@ Query and investigate security data in a Devo domain, and triage Devo alerts.
   IP or host did), `timeline` (merge an activity sweep into one event list), `teams` (Teams
   conversations, meetings and calls), `lag` (ingestion lag per table), `batch` (many queries from a
   JSON spec), `fields` and `profile` (field profiles), `cache` (the local domain cache) (all
-  read-only against Devo) and `comment` (preview by default; posts only with `--confirm`).
-- `skills/devo/references/`: generic material only. The Query and Alerts APIs, LINQ syntax and
+  read-only against Devo), `boards`, `board`, `board-new` and `board-check` (dashboards: list, read,
+  build and test, read-only), and `comment`, `board-push`, `board-set`, `board-clone` and `board-delete`
+  (preview by default; they send only with `--confirm`, and board changes keep a local backup).
+- `skills/devo/references/`: generic material only. The Query, Alerts and Activeboards APIs, LINQ syntax and
   functions, the full list of LINQ traps (`linq-traps.md`), command details (`commands.md`), the
   question playbooks (`playbooks.md`), Devo's table catalogue, per-family guides to Devo's standard
   tables (`table-guide/`), the investigation playbook, and Devo's public SecOps detection library.
