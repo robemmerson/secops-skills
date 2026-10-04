@@ -2378,6 +2378,7 @@ def run_source(cfg, src, terms, frm_s, to_s, limit, timeout, out_dir, rows=False
         events = len(recs)
     return {"source": src["name"], "table": src["table"], "query": linq, "rows": len(recs), "events": events,
             "accounts": sorted(accounts), "matched": matched, "first": min(firsts) if firsts else None,
+            "actor_fields": actor_fields(src), "target_fields": src.get("target") or [],
             "last": max(lasts) if lasts else None, "limit_reached": bool(info["full"]), "retried": info["retried"],
             "splits": info["splits"], "note": src.get("note", ""), "file": path, "mode": "rows" if rows else
             ("grouped" if src.get("group") else "rows"),
@@ -2664,7 +2665,8 @@ ENUM_NAME = re.compile(r"(^|_)(operation|action|activity|activitytype|eventid|ev
 ROLE_RULES = [  # (role, name regex, patterns that support it or None for name-only)
     ("time", re.compile(r"date|time|timestamp|created|when", re.I),
      {"iso-time", "epoch-ms", "epoch-s", "date", "time-of-day"}),
-    ("ip", re.compile(r"ip|addr|address", re.I), {"ipv4", "ipv6", "ipv4:port"}),
+    ("ip", re.compile(r"(^|[_.\d])[iI][pP]|[a-z]I[pP](?![a-z])|[aA]ddr"), {"ipv4", "ipv6", "ipv4:port"}),
+    # (case-sensitive: srcIp, clientIP, remote_ip, IpAddress; not the "ip" inside Principal or ShipTo)
     ("user", re.compile(r"user|account|actor|upn|principal|owner|login|initiatedby|email|mail|sender|recipient|"
                         r"identity|member", re.I), {"email", "email-quoted", "domain\\user", "token", "sid", "guid"}),
     ("host", re.compile(r"host|machine|computer|workstation|device|server|fqdn|agent.*name|node", re.I),
@@ -3405,7 +3407,40 @@ def record_time(rec, fam):
     return None, None
 
 
-def normalise(rec, source, table, fam, role):
+TARGET_FIELD = re.compile(r"^target_(upn|name)$|^TargetUserOrGroupName$")  # user-like, but the object acted on
+
+
+def actor_fields(src):
+    """The fields naming who acted, in preference order: the recipe's `actor`, else its `accounts` for
+    user sweeps (an IP or host sweep's `accounts` may be the swept IP/host fields)."""
+    if "actor" in src:
+        return list(src["actor"] or [])
+    if src.get("by", "user") == "user":
+        return [k for k in src.get("accounts") or [] if not TARGET_FIELD.search(k)]
+    return []
+
+
+_RECIPES = None
+
+
+def recipe_fields(name):
+    """(actor fields, target fields) from the hint recipe `name`, for a summary.json written before
+    activity recorded them. Generated (auto_*) sources have no recipe: ([], [])."""
+    global _RECIPES
+    if _RECIPES is None:
+        try:
+            _RECIPES = {s["name"]: s for s in load_activity_sources()["sources"]}
+        except (OSError, ValueError, KeyError):
+            _RECIPES = {}
+    src = _RECIPES.get(name)
+    return (actor_fields(src), src.get("target") or []) if src else ([], [])
+
+
+def normalise(rec, source, table, fam, role, actor=(), target=()):
+    """One activity record as a timeline event. `actor`/`target`: the source's fields for those slots,
+    in preference order. With `actor` given, no other field becomes the actor (a computed target column
+    such as target_upn can come back first and looks like a user); without it, the first user-like
+    field does, except target-like names (TARGET_FIELD), which go to `target`."""
     t, basis = record_time(rec, fam)
     if not t:
         return None
@@ -3418,11 +3453,22 @@ def normalise(rec, source, table, fam, role):
             ev["t_last_utc"] = iso_utc(last)
     slots = {"user": "actor", "action": "action", "ip": "ip", "host": "host", "url/domain": "target",
              "process/file": "target"}
-    rest = []
+    rest, taken = [], set()
+    for slot, fields in (("actor", actor), ("target", target)):
+        for k in fields or ():
+            v = rec.get(k)
+            if v not in (None, "", [], {}) and str(v).strip('"') not in ("", "null"):
+                ev[slot] = (v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)).strip('"')
+                taken.add(k)
+                break
     for k, v in rec.items():
-        if k in NOT_DETAIL or k.endswith("_local") or v in (None, "", [], {}):
+        if k in taken or k in NOT_DETAIL or k.endswith("_local") or v in (None, "", [], {}):
             continue
         slot = slots.get(role(k))
+        if k in actor or TARGET_FIELD.search(k):
+            slot = "target" if TARGET_FIELD.search(k) else None  # an unused actor field is detail
+        elif slot == "actor" and actor:
+            slot = None
         sv = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
         if slot and ev[slot] is None:
             ev[slot] = sv.strip('"')
@@ -3467,6 +3513,10 @@ def build_timeline(act_dir, tz=None, fm=None, families=None):
             continue
         table, fam = src["table"], event_time_for(src["table"], families)
         role = field_roles(table, fm)
+        if "actor_fields" in src:
+            act_f, tgt_f = src["actor_fields"], src.get("target_fields") or []
+        else:
+            act_f, tgt_f = recipe_fields(src["source"])
         basis = set()
         recs = list(_read_jsonl(path))
         # Where Entra audit is fed by two collectors, one copy has tenantId, the other null or "-". Drop the
@@ -3483,7 +3533,7 @@ def build_timeline(act_dir, tz=None, fm=None, families=None):
                         dropped[src["source"]] = dropped.get(src["source"], 0) + 1
                         continue
                     seen.add(k)
-            ev = normalise(rec, src["source"], table, fam, role)
+            ev = normalise(rec, src["source"], table, fam, role, act_f, tgt_f)
             if ev:
                 ev["attribution"] = src.get("attribution") or "direct"
                 subj = str(rec.get("SubjectUserName") or "")
@@ -6071,8 +6121,11 @@ def generated_source(table, prof, by):
     match = [f"{k} = {{T}}" if fields[k]["type"] in ("ip4", "ip6") else f"weakhas({k}, {{T}})" for k in keys]
     group = list(dict.fromkeys(keys + pick("action", 2) + pick("user", 2) + pick("ip", 2) + pick("host", 1)
                                + pick("outcome", 1)))[:8]
+    users = [k for k in (keys if by == "user" else []) + pick("user", 2) if k in group]
     return {"by": by, "name": f"auto_{by}_" + re.sub(r"[^A-Za-z0-9]+", "_", table), "table": table,
             "filter": " or ".join(match), "group": ", ".join(group), "accounts": keys, "generated": True,
+            "actor": list(dict.fromkeys(k for k in users if not TARGET_FIELD.search(k))),
+            "target": list(dict.fromkeys(k for k in users if TARGET_FIELD.search(k))),
             "note": "generated from the field profile; check the results make sense"}
 
 

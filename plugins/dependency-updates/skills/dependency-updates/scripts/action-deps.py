@@ -13,6 +13,9 @@ Needs `gh` (authenticated) and PyYAML.
   python3 action-deps.py check [--min-age-hours 72] [paths...]
   python3 action-deps.py resolve OWNER/REPO TAG
   python3 action-deps.py inputs  OWNER/REPO[/PATH] REF
+
+Exit codes: 0 done, 1 an action or tag could not be read (check reports the
+rest), 2 gh is missing or not authenticated.
 """
 
 import argparse
@@ -39,14 +42,24 @@ SHA = re.compile(r"^[0-9a-f]{40}$")
 PIN_MAJOR = re.compile(r"^v?(\d+)(?:\.\d+){0,2}$")
 # How many gate-failing releases to step past looking for one old enough.
 MAX_FALLBACK = 10
+NOT_LOGGED_IN = re.compile(r"gh auth login|not logged in|HTTP 401|Bad credentials", re.I)
+
+
+class GhUnavailable(Exception):
+    """gh is missing or not authenticated: every call would fail, so stop at the first."""
 
 
 def gh(path, jq=None):
     cmd = ["gh", "api", path]
     if jq:
         cmd += ["--jq", jq]
-    out = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise GhUnavailable("gh CLI not found: install it (https://cli.github.com) and run `gh auth login`")
     if out.returncode != 0:
+        if NOT_LOGGED_IN.search(out.stderr):
+            raise GhUnavailable(f"gh is not authenticated ({out.stderr.strip()}); run `gh auth login`")
         raise RuntimeError(f"gh api {path} failed: {out.stderr.strip()}")
     return out.stdout.strip()
 
@@ -424,7 +437,14 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if getattr(args, "paths", None) == []:
         args.paths = [".github/workflows"]
-    return args.func(args)
+    try:
+        return args.func(args)
+    except GhUnavailable as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except RuntimeError as e:  # resolve / inputs on a missing repo, tag or file
+        print(f"error: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

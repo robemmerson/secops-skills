@@ -1564,5 +1564,138 @@ class BoardTests(unittest.TestCase):
         self.assertIn("group every 1h", json.loads(reqs[1].data)["query"])
 
 
+class TimelineActorTests(unittest.TestCase):
+    """The timeline actor is the field the source names, not the first user-like column: Devo returns
+    computed `pre` columns (target_upn) ahead of the initiator."""
+    ADMIN, USER = "admin.one@example.test", "user.two@example.test"
+    GUEST = "guest_partner.test#EXT#@tenant.example.test"
+    AUDIT = "cloud.azure.ad.audit"
+
+    def audit(self, op, target, initiator=ADMIN, app=None, t="2026-10-01T09:00:00.000Z"):
+        rec = {"target_upn": target, "target_name": target.split("@")[0], "event_time": t, "eventdate": t,
+               "operationName": op, "tenantId": "t1", "properties_loggedByService": "Core Directory",
+               "properties_result": "success", "properties_initiatedBy_user_userPrincipalName": initiator}
+        if app:
+            rec["properties_initiatedBy_app_displayName"] = app
+        return rec
+
+    def timeline(self, files, recorded=False):
+        """files: {source: (table, records)}. recorded: write actor/target fields into summary.json as
+        activity now does; otherwise the summary predates them and the recipe supplies them."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d)
+        recipes = {s["name"]: s for s in devo.load_activity_sources()["sources"]}
+        sources = []
+        for name, (table, recs) in files.items():
+            path = os.path.join(d, f"{name}.jsonl")
+            with open(path, "w") as f:
+                for r in recs:
+                    f.write(json.dumps(r) + "\n")
+            s = {"source": name, "table": table, "rows": len(recs), "file": path, "mode": "rows"}
+            if name in recipes and recipes[name].get("attribution"):
+                s["attribution"] = recipes[name]["attribution"]
+            if recorded and name in recipes:
+                s["actor_fields"] = devo.actor_fields(recipes[name])
+                s["target_fields"] = recipes[name].get("target") or []
+            sources.append(s)
+        with open(os.path.join(d, "summary.json"), "w") as f:
+            json.dump({"term": "x", "terms": ["x"], "window": ["a", "b"], "sources": sources}, f)
+        roles = os.path.join(devo.HINTS, "field-roles.json")
+        out = {}
+        for label, fm in (("name-only", {"tables": {}}),
+                          ("curated", devo.apply_roles({"tables": {t: {"fields": {
+                              k: {"role": devo.guess_role(k, "str", set())} for r in recs for k in r}}
+                              for t, recs in files.values()}}, roles))):  # as profiled, then curated
+            out[label] = devo.build_timeline(d, fm=fm)[0]
+        return out
+
+    def each(self, files, check, recorded=(False, True)):
+        for rec in recorded:
+            for label, events in self.timeline(files, rec).items():
+                with self.subTest(roles=label, recorded=rec):
+                    check(events) if check.__code__.co_argcount == 1 else check(events, label)
+
+    def test_add_member_actor_is_the_initiator(self):
+        def check(ev):
+            self.assertEqual(len(ev), 1)
+            self.assertEqual(ev[0]["actor"], self.ADMIN)
+            self.assertEqual(ev[0]["target"], self.USER)
+            self.assertNotIn(self.ADMIN, ev[0]["ip"] or "")
+        self.each({"entra_audit": (self.AUDIT, [self.audit("Add member to group", self.USER)])}, check)
+
+    def test_invite_external_user_actor_is_the_initiator(self):
+        def check(ev):
+            self.assertEqual(ev[0]["actor"], self.ADMIN)
+            self.assertEqual(ev[0]["target"], self.GUEST)
+        self.each({"entra_audit": (self.AUDIT, [self.audit("Invite external user", self.GUEST)])}, check)
+
+    def test_app_initiated_change_does_not_make_the_target_the_actor(self):
+        def check(ev):
+            self.assertNotEqual(ev[0]["actor"], self.USER)
+            self.assertEqual(ev[0]["actor"], "Example Sync App")
+            self.assertEqual(ev[0]["target"], self.USER)
+        self.each({"entra_audit": (self.AUDIT, [self.audit("Add user", self.USER, initiator=None,
+                                                           app="Example Sync App")])}, check)
+
+    def test_target_attribution_source_is_unchanged(self):
+        rec = {"operationName": "Add member to group", "properties_loggedByService": "Core Directory",
+               "properties_initiatedBy_user_userPrincipalName": self.ADMIN, "n": 2,
+               "first": "2026-10-01T09:00:00.000Z", "last": "2026-10-01T09:30:00.000Z"}
+
+        def check(ev):
+            self.assertEqual(ev[0]["actor"], self.ADMIN)
+            self.assertEqual(ev[0]["attribution"], "target")
+            self.assertEqual(ev[0]["action"], "Add member to group")
+            self.assertEqual(ev[0]["count"], 2)
+        self.each({"entra_audit_target": (self.AUDIT, [rec])}, check)
+
+    def test_source_without_pre_is_unchanged(self):
+        iam = {"userIdentity_arn": "arn:aws:iam::111122223333:user/jsmith", "eventName": "CreateAccessKey",
+               "sourceIPAddress": "203.0.113.10", "errorCode": None, "n": 1,
+               "first": "2026-10-01T08:00:00.000Z", "last": "2026-10-01T08:00:00.000Z"}
+        unix = {"machine": "host01", "appName": "sshd", "n": 3,
+                "first": "2026-10-01T07:00:00.000Z", "last": "2026-10-01T07:10:00.000Z"}
+
+        def check(ev, roles):  # the values the timeline gave before actor fields existed
+            by = {e["source"]: e for e in ev}
+            self.assertEqual({k: by["aws_iam"][k] for k in ("actor", "action", "target", "ip", "host")},
+                             {"actor": "arn:aws:iam::111122223333:user/jsmith", "action": "CreateAccessKey",
+                              "target": None, "ip": "203.0.113.10", "host": None})
+            self.assertEqual({k: by["linux"][k] for k in ("actor", "action", "target", "ip", "host", "detail")},
+                             {"actor": None, "action": None, "ip": None, "host": "host01",
+                              **({"target": "sshd", "detail": None} if roles == "curated"  # appName: process/file
+                                 else {"target": None, "detail": "appName=sshd"})})
+        self.each({"aws_iam": ("cloud.aws.cloudtrail.iam", [iam]), "linux": ("box.unix", [unix])}, check)
+
+    def test_target_like_field_never_becomes_the_actor(self):
+        # a generated source (no recipe) whose row has a computed target column first
+        rec = {"target_upn": self.USER, "eventdate": "2026-10-01T09:00:00.000Z", "Operation": "Shared",
+               "UserId": self.ADMIN}
+
+        def check(ev):
+            self.assertEqual(ev[0]["actor"], self.ADMIN)
+            self.assertEqual(ev[0]["target"], self.USER)
+        self.each({"auto_user_example_table": ("app.example.audit", [rec])}, check, recorded=(False,))
+
+    def test_actor_fields_from_recipes(self):
+        self.assertEqual(devo.actor_fields({"by": "user", "accounts": ["a", "target_upn"]}), ["a"])
+        self.assertEqual(devo.actor_fields({"by": "ip", "accounts": ["srcIp"]}), [])  # swept IP, not an actor
+        self.assertEqual(devo.actor_fields({"by": "user", "accounts": ["a"], "actor": ["b"]}), ["b"])
+        g = devo.generated_source("app.example.audit", {"rows": 100, "fields": {
+            "target_upn": {"role": "user", "fill": 0.9, "type": "str", "len": 20},
+            "actor_email": {"role": "user", "fill": 0.8, "type": "str", "len": 20},
+            "op": {"role": "action", "fill": 1.0, "type": "str", "len": 10}}}, "user")
+        self.assertEqual(g["actor"], ["actor_email"])
+        self.assertEqual(g["target"], ["target_upn"])
+
+    def test_principal_is_not_an_ip_field(self):
+        for name in ("properties_initiatedBy_user_userPrincipalName", "properties_servicePrincipalName",
+                     "ShipTo"):
+            self.assertNotEqual(devo.guess_role(name, "str", set()), "ip", name)
+        for name in ("srcIp", "clientIP", "ClientIPAddress", "sourceIPAddress", "IpAddress", "remote_ip",
+                     "actor_ipv4", "ip"):
+            self.assertEqual(devo.guess_role(name, "str", set()), "ip", name)
+
+
 if __name__ == "__main__":
     unittest.main()

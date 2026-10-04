@@ -3,7 +3,9 @@
 Query and investigate security data in a Devo domain, triage Devo alerts, and build Devo dashboards
 (Activeboards).
 
-- `skills/devo/SKILL.md`: workflow, LINQ traps, triage steps, and how the domain cache is used.
+- `skills/devo/SKILL.md`: setup and safety rules, the command synopsis, workflow, the most common
+  LINQ traps, triage steps, and how the domain cache is used. Loaded whenever the skill triggers, so
+  detail lives in references loaded on demand.
 - `skills/devo/scripts/devo.py`: helper with commands `check`, `query`, `schema`, `tables`,
   `alerts`, `alert`, `alert-defs`, `coverage` (is a host logging?), `activity` (everything a user,
   IP or host did), `timeline` (merge an activity sweep into one event list), `teams` (Teams
@@ -13,10 +15,11 @@ Query and investigate security data in a Devo domain, triage Devo alerts, and bu
   build and test, read-only), and `comment`, `board-push`, `board-set`, `board-clone` and `board-delete`
   (preview by default; they send only with `--confirm`, and board changes keep a local backup).
 - `skills/devo/references/`: generic material only. The Query, Alerts and Activeboards APIs, LINQ syntax and
-  functions, Devo's table catalogue, per-family guides to Devo's standard tables
-  (`table-guide/`), the investigation playbook, and Devo's public SecOps detection library.
+  functions, the full list of LINQ traps (`linq-traps.md`), command details (`commands.md`), the
+  question playbooks (`playbooks.md`), Devo's table catalogue, per-family guides to Devo's standard
+  tables (`table-guide/`), the investigation playbook, and Devo's public SecOps detection library.
 - `skills/devo/references/hints/`: seeds for Devo's standard parsers. `activity-sources.json` holds
-  the sweep recipes, `event-time.json` the event-time expressions and dedupe ids, and
+  the sweep recipes (including which fields name the actor and the target, for `timeline`), `event-time.json` the event-time expressions and dedupe ids, and
   `field-roles.json` the curated field roles. The helper validates them against each domain.
 - `tests/`: offline unit tests (`python3 -m unittest discover -s plugins/devo/tests`).
 

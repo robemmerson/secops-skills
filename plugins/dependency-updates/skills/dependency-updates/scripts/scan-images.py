@@ -116,7 +116,9 @@ def main(argv=None):
     buckets, commented, files = defaultdict(list), 0, 0
     for root in map(Path, args.paths or ["."]):
         for f in walk(root):
-            if any(fnmatch.fnmatch(str(f), g) for g in args.exclude):
+            # Match the path as given and relative to the root, so 'tests/*' works for any root.
+            names = {str(f), str(f.relative_to(root)) if root.is_dir() else f.name}
+            if any(fnmatch.fnmatch(n, g) for n in names for g in args.exclude):
                 continue
             hits = list(scan_file(f, args.all_yaml))
             files += bool(hits)
