@@ -1,0 +1,7 @@
+# Privileged grants (investigations.md §4): devo.py batch <this file> --vars from=30d --out-dir DIR, then devo.py grants DIR
+{"name": "entra_role_changes", "query_file": "entra_role_changes.linq", "from": "{from}", "to": "now", "chunk": "3d", "limit": 0}
+{"name": "ad_group_changes", "query_file": "ad_group_changes.linq", "from": "{from}", "to": "now", "chunk": "1d", "parallel": 6, "limit": 0}
+{"name": "ad_accounts_created", "query_file": "ad_accounts_created.linq", "from": "{from}", "to": "now", "chunk": "1d", "parallel": 6, "limit": 0}
+{"name": "sid_names", "query_file": "sid_names.linq", "from": "7d", "to": "now", "chunk": "1d", "parallel": 6, "limit": 0}
+{"name": "azure_tables", "query_file": "azure_tables.linq", "from": "7d", "to": "now", "limit": 0}
+{"name": "cloud_audit_sources", "query_file": "cloud_audit_sources.linq", "from": "1d", "to": "now", "chunk": "6h", "limit": 0}

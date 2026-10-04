@@ -1,0 +1,1123 @@
+{
+ "_comment": "Sweep recipes for `devo.py activity <term> --by user|ip|host`, for Devo's standard tables. Each source has `by` (which sweep), `table`, `filter` ({T} is replaced with the quoted term), optional `pre` (a select clause run before grouping, e.g. peek() on Message), either `group` (grouped with count/first/last, re-aggregated across chunks) or `select`, optional `chunk`/`parallel`, `accounts` (fields shown under 'entities seen'; when absent, any value containing the term), and `note`. These are hints, not facts about your domain: on first use the helper keeps only the sources whose table exists in the domain and whose fields are in the table's live schema, adds generated sources for other tables with user/IP/host fields, and caches the result (`devo.py cache status`).",
+ "sources": [
+  {
+   "by": "user",
+   "name": "onepassword_audit",
+   "table": "auth.agilebits.onepassword.audit",
+   "filter": "weakhas(actor_details__email, {T}) or weakhas(aux_details__email, {T})",
+   "group": "actor_details__email, aux_details__email, action, object_type, session__ip",
+   "accounts": [
+    "actor_details__email",
+    "aux_details__email"
+   ],
+   "note": "dlgsess/ssotknv rows are session plumbing; the rest are admin/item changes"
+  },
+  {
+   "by": "user",
+   "name": "onepassword_items",
+   "table": "auth.agilebits.onepassword.itemusage",
+   "filter": "weakhas(user__email, {T})",
+   "group": "user__email, action, vault_uuid, item_uuid, client__app_name, client__platform_name, client__ip_address",
+   "accounts": [
+    "user__email"
+   ],
+   "note": "item/vault are uuids only (no names)"
+  },
+  {
+   "name": "onepassword_signin",
+   "table": "auth.agilebits.onepassword.signinattempt",
+   "filter": "weakhas(target_user__email, {T})",
+   "select": "*",
+   "accounts": [
+    "target_user__email"
+   ],
+   "note": "client__platform_name = device hostname",
+   "by": "user"
+  },
+  {
+   "by": "user",
+   "name": "linux",
+   "table": "box.unix",
+   "filter": "appName in {\"sshd\", \"sshd-session\", \"sudo\", \"su\", \"systemd-logind\"}, weakhas(message, {T})",
+   "group": "machine, appName",
+   "chunk": "3h",
+   "parallel": 8
+  },
+  {
+   "by": "user",
+   "name": "windows_powershell_4103",
+   "table": "box.win_nxlog.powershell",
+   "filter": "EventID = 4103, weakhas(ContextInfo, {T})",
+   "group": "host, EventID",
+   "chunk": "3h",
+   "parallel": 6,
+   "note": "4103 ContextInfo has 'User = DOMAIN\\\\user' and 'Host Application = <command line>'; 4104 has no parsed user (only rawMessage AccountName)"
+  },
+  {
+   "by": "user",
+   "name": "windows_powershell_4104_account",
+   "table": "box.win_nxlog.powershell",
+   "filter": "EventID = 4104, weakhas(rawMessage, {T})",
+   "group": "host, Path",
+   "chunk": "3h",
+   "parallel": 6,
+   "note": "matches the AccountName/Domain kept only in rawMessage, but also any script text containing the term",
+   "attribution": "raw-text"
+  },
+  {
+   "by": "user",
+   "name": "windows_security",
+   "table": "box.win_nxlog.security",
+   "filter": "weakhas(TargetUserName, {T}) or weakhas(SubjectUserName, {T})",
+   "group": "EventID, host, TargetUserName, SubjectUserName, LogonType, WorkstationName, src",
+   "chunk": "1h",
+   "parallel": 5,
+   "accounts": [
+    "TargetUserName",
+    "SubjectUserName"
+   ],
+   "pre": "peek(Message, re(\"Source Network Address:\\\\s*([^\\\\r\\\\n\\\\t]+)\"), 1) as src",
+   "note": "src = the client address from Message (Source Network Address); IpAddress may be the reporting host"
+  },
+  {
+   "name": "windows_sysmon",
+   "table": "box.win_nxlog.sysmon",
+   "filter": "weakhas(User, {T})",
+   "group": "host, User, EventID, Image",
+   "chunk": "3h",
+   "parallel": 6,
+   "accounts": [
+    "User"
+   ],
+   "by": "user"
+  },
+  {
+   "by": "user",
+   "name": "aws_cloudtrail",
+   "table": "cloud.aws.cloudtrail.cloudtrail",
+   "filter": "weakhas(userIdentity_arn, {T})",
+   "group": "ACCID, userIdentity_arn, eventName, sourceIPAddress",
+   "accounts": [
+    "userIdentity_arn"
+   ],
+   "note": "SSO users appear as assumed-role/AWSReservedSSO_<permission set>_<hash>/<upn>"
+  },
+  {
+   "by": "user",
+   "name": "aws_ec2",
+   "table": "cloud.aws.cloudtrail.ec2",
+   "filter": "weakhas(userIdentity_arn, {T})",
+   "group": "ACCID, userIdentity_arn, eventName, sourceIPAddress, errorCode",
+   "accounts": [
+    "userIdentity_arn"
+   ],
+   "note": "SSO users appear as assumed-role/AWSReservedSSO_<permission set>_<hash>/<upn>"
+  },
+  {
+   "name": "aws_iam",
+   "table": "cloud.aws.cloudtrail.iam",
+   "filter": "weakhas(userIdentity_arn, {T})",
+   "group": "userIdentity_arn, eventName, sourceIPAddress, errorCode",
+   "accounts": [
+    "userIdentity_arn"
+   ],
+   "by": "user"
+  },
+  {
+   "by": "user",
+   "name": "aws_kms",
+   "table": "cloud.aws.cloudtrail.kms",
+   "filter": "weakhas(userIdentity_arn, {T})",
+   "group": "ACCID, userIdentity_arn, eventName, sourceIPAddress, errorCode",
+   "accounts": [
+    "userIdentity_arn"
+   ],
+   "note": "SSO users appear as assumed-role/AWSReservedSSO_<permission set>_<hash>/<upn>"
+  },
+  {
+   "by": "user",
+   "name": "aws_lambda",
+   "table": "cloud.aws.cloudtrail.lambda",
+   "filter": "weakhas(userIdentity_arn, {T})",
+   "group": "ACCID, userIdentity_arn, eventName, sourceIPAddress, errorCode",
+   "accounts": [
+    "userIdentity_arn"
+   ],
+   "note": "SSO users appear as assumed-role/AWSReservedSSO_<permission set>_<hash>/<upn>"
+  },
+  {
+   "by": "user",
+   "name": "aws_organizations",
+   "table": "cloud.aws.cloudtrail.organizations",
+   "filter": "weakhas(userIdentity_arn, {T})",
+   "group": "ACCID, userIdentity_arn, eventName, sourceIPAddress",
+   "accounts": [
+    "userIdentity_arn"
+   ],
+   "note": "SSO users appear as assumed-role/AWSReservedSSO_<permission set>_<hash>/<upn>"
+  },
+  {
+   "by": "user",
+   "name": "aws_s3",
+   "table": "cloud.aws.cloudtrail.s3",
+   "filter": "weakhas(userIdentity_arn, {T})",
+   "group": "ACCID, userIdentity_arn, eventName, sourceIPAddress, errorCode",
+   "accounts": [
+    "userIdentity_arn"
+   ],
+   "chunk": "1d"
+  },
+  {
+   "by": "user",
+   "name": "aws_secretsmanager",
+   "table": "cloud.aws.cloudtrail.secretsmanager",
+   "filter": "weakhas(userIdentity__arn, {T})",
+   "group": "ACCID, userIdentity__arn, eventName, sourceIPAddress_str",
+   "accounts": [
+    "userIdentity__arn"
+   ],
+   "note": "this table uses userIdentity__arn (double underscore) and sourceIPAddress_str"
+  },
+  {
+   "by": "user",
+   "name": "aws_signin",
+   "table": "cloud.aws.cloudtrail.signin",
+   "filter": "weakhas(userIdentity_arn, {T}) or weakhas(rawMessage, {T})",
+   "group": "ACCID, userIdentity_type, userIdentity_arn, eventName, responseElements_ConsoleLogin, sourceIPAddress",
+   "accounts": [
+    "userIdentity_arn"
+   ]
+  },
+  {
+   "by": "user",
+   "name": "aws_sts",
+   "table": "cloud.aws.cloudtrail.sts",
+   "filter": "weakhas(userIdentity_arn, {T}) or weakhas(requestParameters_roleSessionName, {T})",
+   "group": "ACCID, userIdentity_type, userIdentity_arn, eventName, requestParameters_roleArn, requestParameters_roleSessionName, sourceIPAddress",
+   "accounts": [
+    "userIdentity_arn",
+    "requestParameters_roleSessionName"
+   ]
+  },
+  {
+   "name": "entra_audit",
+   "table": "cloud.azure.ad.audit",
+   "filter": "weakhas(properties_initiatedBy_user_userPrincipalName, {T})",
+   "select": "eventdate, operationName, tenantId, properties_loggedByService, properties_result, properties_initiatedBy_user_userPrincipalName, target_upn, target_name",
+   "accounts": [
+    "properties_initiatedBy_user_userPrincipalName"
+   ],
+   "by": "user",
+   "pre": "str(jqeval(jqcompile(\".[0].userPrincipalName\"), properties_targetResources)) as target_upn, str(jqeval(jqcompile(\".[0].displayName\"), properties_targetResources)) as target_name",
+   "note": "target_upn/target_name = the first target (a #EXT# UPN is a B2B guest)"
+  },
+  {
+   "by": "user",
+   "name": "entra_audit_target",
+   "table": "cloud.azure.ad.audit",
+   "filter": "weakhas(stringify(properties_targetResources), {T})",
+   "group": "operationName, properties_loggedByService, properties_initiatedBy_user_userPrincipalName, properties_initiatedBy_app_displayName",
+   "accounts": [
+    "properties_initiatedBy_user_userPrincipalName"
+   ],
+   "note": "where two collectors feed this table, count rows with tenantId set (the other copy is a duplicate)",
+   "attribution": "target"
+  },
+  {
+   "by": "user",
+   "name": "entra_noninteractive",
+   "table": "cloud.azure.ad.noninteractive_user_signin",
+   "filter": "weakhas(properties_userPrincipalName, {T})",
+   "group": "properties_userPrincipalName, properties_userId, properties_ipAddress, properties_location_countryOrRegion, properties_appDisplayName, properties_status_errorCode",
+   "chunk": "3h",
+   "parallel": 6,
+   "accounts": [
+    "properties_userPrincipalName"
+   ],
+   "attribution": "automated"
+  },
+  {
+   "by": "user",
+   "name": "entra_provisioning",
+   "table": "cloud.azure.ad.provisioning",
+   "filter": "isnotnull(properties_id), weakhas(sourceIdentityDetailsUserPrincipalName, {T})",
+   "group": "sourceIdentityDetailsUserPrincipalName, properties_servicePrincipal_Name, provisioningAction, provisioningStepsStatus",
+   "accounts": [
+    "sourceIdentityDetailsUserPrincipalName"
+   ]
+  },
+  {
+   "by": "user",
+   "name": "entra_interactive",
+   "table": "cloud.azure.ad.signin",
+   "filter": "weakhas(properties_userPrincipalName, {T})",
+   "group": "properties_userPrincipalName, properties_userId, properties_ipAddress, properties_location_countryOrRegion, properties_appDisplayName, properties_clientAppUsed, properties_status_errorCode, properties_deviceDetail_displayName",
+   "accounts": [
+    "properties_userPrincipalName"
+   ]
+  },
+  {
+   "by": "user",
+   "name": "entra_risk",
+   "table": "cloud.azure.ad.user_risk_events",
+   "filter": "weakhas(properties__userPrincipalName, {T})",
+   "group": "properties__userPrincipalName, properties__riskEventType, properties__riskLevel, properties__riskState, properties__ipAddress",
+   "accounts": [
+    "properties__userPrincipalName"
+   ],
+   "note": "Identity Protection detections; properties__requestId = sign-in properties_id"
+  },
+  {
+   "by": "user",
+   "name": "defender_logged_on",
+   "table": "cloud.azure.ah.device_info",
+   "filter": "weakhas(logged_on_users, {T})",
+   "group": "device_name, os_platform, public_ip",
+   "accounts": []
+  },
+  {
+   "by": "user",
+   "name": "defender_logons",
+   "table": "cloud.azure.ah.device_logon_event",
+   "filter": "weakhas(account_name, {T})",
+   "group": "device_name, account_domain, account_name, action_type, logon_type, remote_ip",
+   "accounts": [
+    "account_name"
+   ]
+  },
+  {
+   "by": "user",
+   "name": "defender_network",
+   "table": "cloud.azure.ah.device_network_event",
+   "filter": "weakhas(init_process_account_name, {T}), action_type = \"ConnectionSuccess\"",
+   "group": "device_name, init_process_account_name, init_process_file_name, remote_url, remote_port",
+   "chunk": "6h",
+   "parallel": 4,
+   "accounts": [
+    "init_process_account_name"
+   ]
+  },
+  {
+   "by": "user",
+   "name": "defender_processes",
+   "table": "cloud.azure.ah.device_process_event",
+   "filter": "weakhas(account_name, {T}) or weakhas(account_upn, {T})",
+   "group": "device_name, account_domain, account_name, account_upn, file_name",
+   "chunk": "6h",
+   "parallel": 4,
+   "accounts": [
+    "account_name",
+    "account_upn"
+   ]
+  },
+  {
+   "by": "user",
+   "name": "entra_gsa",
+   "table": "cloud.azure.others.events",
+   "filter": "category in {\"NetworkAccessTrafficLogs\", \"NetworkAccessConnectionEvents\"}, weakhas(stringify(properties), {T})",
+   "select": "eventdate, category, jqeval(jqcompile(\".UserPrincipalName\"), properties) as upn, jqeval(jqcompile(\".ClientDeviceName\"), properties) as device, jqeval(jqcompile(\".SourceIp\"), properties) as src, jqeval(jqcompile(\".DestinationFQDN\"), properties) as dest",
+   "chunk": "1d",
+   "parallel": 8
+  },
+  {
+   "name": "o365_azureactivedirectory",
+   "table": "cloud.office365.management.azureactivedirectory",
+   "filter": "weakhas(UserId, {T})",
+   "group": "UserId, Operation, ClientIP",
+   "accounts": [
+    "UserId"
+   ],
+   "by": "user"
+  },
+  {
+   "name": "o365_copilot",
+   "table": "cloud.office365.management.copilot",
+   "filter": "weakhas(UserId, {T})",
+   "group": "UserId, Operation, ClientIP",
+   "accounts": [
+    "UserId"
+   ],
+   "by": "user"
+  },
+  {
+   "by": "user",
+   "name": "o365_exchange",
+   "table": "cloud.office365.management.exchange",
+   "filter": "weakhas(UserId, {T}) or weakhas(MailboxOwnerUPN, {T})",
+   "group": "UserId, MailboxOwnerUPN, Operation, ClientIPAddress",
+   "accounts": [
+    "UserId",
+    "MailboxOwnerUPN"
+   ]
+  },
+  {
+   "name": "o365_microsoft365group",
+   "table": "cloud.office365.management.microsoft365group",
+   "filter": "weakhas(UserId, {T})",
+   "group": "UserId, Operation",
+   "accounts": [
+    "UserId"
+   ],
+   "note": "no ClientIP in this table",
+   "by": "user"
+  },
+  {
+   "name": "o365_microsoftforms",
+   "table": "cloud.office365.management.microsoftforms",
+   "filter": "weakhas(UserId, {T})",
+   "group": "UserId, Operation, ClientIP",
+   "accounts": [
+    "UserId"
+   ],
+   "by": "user"
+  },
+  {
+   "name": "o365_microsoftteams",
+   "table": "cloud.office365.management.microsoftteams",
+   "filter": "weakhas(UserId, {T})",
+   "group": "UserId, Operation, ClientIP",
+   "accounts": [
+    "UserId"
+   ],
+   "by": "user"
+  },
+  {
+   "by": "user",
+   "name": "o365_teams_meetings_attended",
+   "table": "cloud.office365.management.microsoftteams",
+   "filter": "Operation = \"MeetingParticipantDetail\", weakhas(message, {T})",
+   "select": "eventdate, UserId, ClientIP, ItemName, str(jqeval(jqcompile(\".Attendees[0].UPN\"), jsonparse(message))) as attendee, str(jsonparse(message)[\"JoinTime\"]) as joined, str(jsonparse(message)[\"LeaveTime\"]) as left_at",
+   "accounts": [
+    "attendee"
+   ],
+   "note": "UserId on these rows is the meeting ORGANIZER; the person is Attendees[0]. The o365_microsoftteams sweep misses meetings a person only attended."
+  },
+  {
+   "by": "user",
+   "name": "o365_microsofttodo_by_oid",
+   "table": "cloud.office365.management.microsofttodo",
+   "filter": "UserId = {T}",
+   "group": "UserId, Operation",
+   "accounts": [
+    "UserId"
+   ],
+   "note": "UserId is the Entra object id (never a UPN): run with the object id from --graph-ids, a surname never matches. Applies to planner app rows too."
+  },
+  {
+   "by": "user",
+   "name": "o365_onedrive",
+   "table": "cloud.office365.management.onedrive",
+   "filter": "weakhas(UserId, {T})",
+   "group": "UserId, Operation, ClientIP, SourceFileName, TargetUserOrGroupName, TargetUserOrGroupType",
+   "accounts": [
+    "UserId"
+   ],
+   "note": "same batch-driven lag and duplication as sharepoint.; sharing operations name the recipient (TargetUserOrGroupName/Type: Guest = outside the tenant)"
+  },
+  {
+   "name": "o365_planner",
+   "table": "cloud.office365.management.planner",
+   "filter": "weakhas(UserId, {T})",
+   "group": "UserId, Operation, ClientIP",
+   "accounts": [
+    "UserId"
+   ],
+   "by": "user"
+  },
+  {
+   "name": "o365_powerbi",
+   "table": "cloud.office365.management.powerbi",
+   "filter": "weakhas(UserId, {T})",
+   "group": "UserId, Operation, ClientIP",
+   "accounts": [
+    "UserId"
+   ],
+   "by": "user"
+  },
+  {
+   "by": "user",
+   "name": "o365_powerplatform",
+   "table": "cloud.office365.management.powerplatform",
+   "filter": "weakhas(UserId, {T})",
+   "select": "eventdate, UserId, ResultStatus, str(jsonparse(rawMessage)[\"Operation\"]) as operation",
+   "accounts": [
+    "UserId"
+   ]
+  },
+  {
+   "name": "o365_securitycompliancecenter",
+   "table": "cloud.office365.management.securitycompliancecenter",
+   "filter": "weakhas(UserId, {T})",
+   "group": "UserId, Operation, ClientIP",
+   "accounts": [
+    "UserId"
+   ],
+   "by": "user"
+  },
+  {
+   "by": "user",
+   "name": "o365_sharepoint",
+   "table": "cloud.office365.management.sharepoint",
+   "filter": "weakhas(UserId, {T})",
+   "group": "UserId, Operation, ClientIP, SourceFileName, TargetUserOrGroupName, TargetUserOrGroupType",
+   "accounts": [
+    "UserId"
+   ],
+   "note": "sharing operations name the recipient (TargetUserOrGroupName/Type: Guest = outside the tenant)"
+  },
+  {
+   "by": "user",
+   "name": "o365_threatintelligence",
+   "table": "cloud.office365.management.threatintelligence",
+   "filter": "weakhas(Recipients, {T}) or weakhas(P1Sender, {T}) or weakhas(P2Sender, {T})",
+   "group": "Operation, Verdict, DeliveryAction, P2Sender",
+   "accounts": [
+    "Recipients",
+    "P2Sender"
+   ]
+  },
+  {
+   "name": "o365_yammer",
+   "table": "cloud.office365.management.yammer",
+   "filter": "weakhas(UserId, {T})",
+   "group": "UserId, Operation, ClientIP",
+   "accounts": [
+    "UserId"
+   ],
+   "by": "user"
+  },
+  {
+   "by": "user",
+   "name": "devo_alert_actions",
+   "table": "devo.audit.alert.triggered",
+   "filter": "weakhas(username, {T})",
+   "group": "username, action, name",
+   "accounts": [
+    "username"
+   ],
+   "note": "who changed status/commented on Devo alerts"
+  },
+  {
+   "name": "sentinelone_mgmt",
+   "table": "edr.sentinelone.management.activities",
+   "filter": "weakhas(dataUsername, {T}) or weakhas(dataActoralternateid, {T}) or weakhas(dataLoginsusername, {T}) or weakhas(dataSourceprocessusername, {T})",
+   "select": "*",
+   "accounts": [
+    "dataUsername",
+    "dataActoralternateid",
+    "dataLoginsusername",
+    "dataSourceprocessusername"
+   ],
+   "by": "user"
+  },
+  {
+   "by": "user",
+   "name": "fortinet_admin",
+   "table": "firewall.fortinet.event.system",
+   "filter": "weakhas(user, {T})",
+   "group": "devName, user, ui, logdesc, action, status",
+   "accounts": [
+    "user"
+   ]
+  },
+  {
+   "by": "user",
+   "name": "fortinet_unauthuser",
+   "table": "firewall.fortinet.traffic.forward",
+   "filter": "weakhas(unauthuser, {T})",
+   "group": "devName, unauthuser, unauthusersource, srcIp",
+   "chunk": "3h",
+   "parallel": 8,
+   "accounts": [
+    "unauthuser"
+   ]
+  },
+  {
+   "name": "devo_alerts",
+   "table": "siem.logtrust.alert.info",
+   "filter": "weakhas(username, {T}) or weakhas(extraData, {T})",
+   "select": "eventdate, alertId, context, username, extraData",
+   "accounts": [
+    "username"
+   ],
+   "by": "user"
+  },
+  {
+   "by": "user",
+   "name": "devo_web",
+   "table": "siem.logtrust.web.navigation",
+   "filter": "weakhas(userEmail, {T})",
+   "group": "userEmail, srcHost, section, action",
+   "accounts": [
+    "userEmail"
+   ],
+   "note": "Devo console use"
+  },
+  {
+   "name": "github_enterprise",
+   "table": "vcs.github.enterprise.audit",
+   "filter": "weakhas(actor, {T}) or weakhas(user, {T}) or weakhas(external_identity_username, {T})",
+   "group": "actor, user, external_identity_username, action, actor_ipv4, actor_location__country_code",
+   "accounts": [
+    "actor",
+    "user",
+    "external_identity_username"
+   ],
+   "by": "user"
+  },
+  {
+   "name": "github_org",
+   "table": "vcs.github.organization.audit",
+   "filter": "weakhas(actor, {T}) or weakhas(external_identity_username, {T})",
+   "group": "actor, external_identity_username, action, repo, event, organization",
+   "accounts": [
+    "actor",
+    "external_identity_username"
+   ],
+   "note": "event=schedule runs are not interactive",
+   "by": "user"
+  },
+  {
+   "name": "zscaler",
+   "table": "vpn.zscaler.access",
+   "filter": "weakhas(Username, {T})",
+   "group": "Username, Application, Host, ServerIP, ServerPort, ClientCountryCode, ConnectionStatus, Platform, ConnectorIP, ClientPublicIp, ClientPrivateIp",
+   "chunk": "3h",
+   "parallel": 6,
+   "accounts": [
+    "Username"
+   ],
+   "by": "user"
+  },
+  {
+   "by": "user",
+   "name": "qualys_users",
+   "table": "vuln.qualys.useractivitylog",
+   "filter": "weakhas(user_name, {T})",
+   "group": "user_name, user_role, module, action, user_ip",
+   "accounts": [
+    "user_name"
+   ]
+  },
+  {
+   "by": "ip",
+   "name": "onepassword_audit_ip",
+   "table": "auth.agilebits.onepassword.audit",
+   "filter": "session__ip = {T}",
+   "group": "actor_details__email, action, object_type"
+  },
+  {
+   "by": "ip",
+   "name": "onepassword_items_ip",
+   "table": "auth.agilebits.onepassword.itemusage",
+   "filter": "client__ip_address = {T}",
+   "group": "user__email, action, client__app_name, client__platform_name"
+  },
+  {
+   "by": "ip",
+   "name": "onepassword_signin_ip",
+   "table": "auth.agilebits.onepassword.signinattempt",
+   "filter": "client__ip_address = {T}",
+   "group": "target_user__email, category, client__app_name, client__platform_name"
+  },
+  {
+   "by": "ip",
+   "name": "linux_ssh_ip",
+   "table": "box.unix",
+   "filter": "appName in {\"sshd\", \"sshd-session\", \"sudo\", \"su\"}, message -> {T}",
+   "group": "machine, appName",
+   "chunk": "6h"
+  },
+  {
+   "by": "ip",
+   "name": "win_security_msg_ip",
+   "table": "box.win_nxlog.security",
+   "filter": "weakhas(Message, {T})",
+   "group": "EventID, host, TargetUserName, SubjectUserName, LogonType",
+   "chunk": "1h",
+   "parallel": 6,
+   "note": "the event's own client/source IP is in Message (Source Network Address / Client Address / Source Address); IpAddress may be the reporting host's own IP where the NxLog config sets it"
+  },
+  {
+   "by": "ip",
+   "name": "sysmon_dns_answer_ip",
+   "table": "box.win_nxlog.sysmon",
+   "filter": "EventID = 22, weakhas(Message, {T})",
+   "group": "host, Image",
+   "chunk": "3h",
+   "parallel": 6,
+   "note": "hosts whose DNS answers contained the IP (QueryResults lists ::ffff:<ip>;). Add peek(Message, re(\"QueryName:\\\\s*([^\\\\r\\\\n]+)\"), 1) for the name"
+  },
+  {
+   "by": "ip",
+   "name": "sysmon_net_ip",
+   "table": "box.win_nxlog.sysmon",
+   "filter": "EventID = 3, DestinationIp = {T} or SourceIp = {T}",
+   "group": "host, User, Image, SourceIp, DestinationIp, DestinationPort, Initiated",
+   "chunk": "3h",
+   "parallel": 6
+  },
+  {
+   "by": "ip",
+   "name": "win_host_by_ip",
+   "table": "box.win_nxlog.system",
+   "filter": "IpAddress = {T}",
+   "group": "host, IpAddress",
+   "note": "answers 'which Windows host is this IP' only where the NxLog config writes the reporting host's own IP into IpAddress: check a few rows first"
+  },
+  {
+   "by": "ip",
+   "name": "aws_ec2_ip",
+   "table": "cloud.aws.cloudtrail.ec2",
+   "filter": "sourceIPAddress = {T}",
+   "group": "ACCID, userIdentity_arn, eventName, errorCode"
+  },
+  {
+   "by": "ip",
+   "name": "aws_signin_ip",
+   "table": "cloud.aws.cloudtrail.signin",
+   "filter": "sourceIPAddress = {T}",
+   "group": "ACCID, userIdentity_type, userIdentity_arn, eventName, responseElements_ConsoleLogin"
+  },
+  {
+   "by": "ip",
+   "name": "aws_sts_ip",
+   "table": "cloud.aws.cloudtrail.sts",
+   "filter": "sourceIPAddress = {T}",
+   "group": "ACCID, userIdentity_type, userIdentity_arn, eventName, requestParameters_roleSessionName"
+  },
+  {
+   "by": "ip",
+   "name": "entra_audit_ip",
+   "table": "cloud.azure.ad.audit",
+   "filter": "properties_initiatedBy_user_ipAddress = {T}",
+   "group": "properties_initiatedBy_user_userPrincipalName, operationName",
+   "note": "often a Microsoft service IP rather than the user's own; where two collectors feed this table, count rows with tenantId set (the other copy is a duplicate)"
+  },
+  {
+   "by": "ip",
+   "name": "graph_ip",
+   "table": "cloud.azure.ad.microsoft_graph_activity_logs",
+   "filter": "properties__ip_address_str = {T}",
+   "group": "properties__user_id, properties__app_id, properties__service_principal_id, properties__request_method",
+   "chunk": "2h",
+   "parallel": 8
+  },
+  {
+   "by": "ip",
+   "name": "entra_noninteractive_ip",
+   "table": "cloud.azure.ad.noninteractive_user_signin",
+   "filter": "properties_ipAddress = {T}",
+   "group": "properties_userPrincipalName, properties_appDisplayName, properties_status_errorCode",
+   "chunk": "3h",
+   "parallel": 6
+  },
+  {
+   "by": "ip",
+   "name": "entra_sp_ip",
+   "table": "cloud.azure.ad.service_principal_signin",
+   "filter": "properties_ipAddress = {T}",
+   "group": "properties_servicePrincipalName, properties_appId, properties_status_errorCode"
+  },
+  {
+   "by": "ip",
+   "name": "entra_signin_ip",
+   "table": "cloud.azure.ad.signin",
+   "filter": "properties_ipAddress = {T}",
+   "group": "properties_userPrincipalName, properties_appDisplayName, properties_status_errorCode"
+  },
+  {
+   "by": "ip",
+   "name": "entra_signin_all",
+   "table": "cloud.azure.ad.signin_all",
+   "filter": "source_ip = {T}",
+   "group": "source, username, error_code"
+  },
+  {
+   "by": "ip",
+   "name": "entra_risk_ip",
+   "table": "cloud.azure.ad.user_risk_events",
+   "filter": "properties__ipAddress = {T}",
+   "group": "properties__userPrincipalName, properties__riskEventType"
+  },
+  {
+   "by": "ip",
+   "name": "defender_ip_egress",
+   "table": "cloud.azure.ah.device_info",
+   "filter": "public_ip = {T}",
+   "group": "device_name, os_platform",
+   "note": "devices whose egress public IP this is"
+  },
+  {
+   "by": "ip",
+   "name": "defender_ip_local",
+   "table": "cloud.azure.ah.device_network_event",
+   "filter": "local_ip = {T}",
+   "group": "device_name, init_process_account_name",
+   "chunk": "6h",
+   "parallel": 4,
+   "note": "which device/user held this internal IP"
+  },
+  {
+   "by": "ip",
+   "name": "defender_ip_remote",
+   "table": "cloud.azure.ah.device_network_event",
+   "filter": "remote_ip = {T}",
+   "group": "device_name, init_process_file_name, remote_port, remote_url, action_type",
+   "chunk": "6h",
+   "parallel": 4
+  },
+  {
+   "by": "ip",
+   "name": "defender_ip_owner",
+   "table": "cloud.azure.ah.device_network_info",
+   "filter": "weakhas(ip_addresses, {T})",
+   "group": "device_name, device_id, network_adapter_status",
+   "note": "internal IP -> device. A bare term also matches longer IPs (10.1.2.3 in 10.1.2.30); confirm in ip_addresses or search with the JSON quotes \"\\\"10.1.2.3\\\"\""
+  },
+  {
+   "by": "ip",
+   "name": "o365_aad_ip",
+   "table": "cloud.office365.management.azureactivedirectory",
+   "filter": "ClientIP -> {T}",
+   "group": "UserId, Operation, ResultStatus",
+   "accounts": [
+    "UserId"
+   ]
+  },
+  {
+   "by": "ip",
+   "name": "o365_copilot_ip",
+   "table": "cloud.office365.management.copilot",
+   "filter": "ClientIP -> {T}",
+   "group": "UserId, Operation, AppIdentity",
+   "accounts": [
+    "UserId"
+   ]
+  },
+  {
+   "by": "ip",
+   "name": "o365_exchange_ip",
+   "table": "cloud.office365.management.exchange",
+   "filter": "ClientIPAddress -> {T} or ClientIP -> {T}",
+   "group": "UserId, Operation",
+   "accounts": [
+    "UserId"
+   ],
+   "note": "ClientIP carries :port on admin cmdlets; ClientIPAddress is always filled."
+  },
+  {
+   "by": "ip",
+   "name": "o365_teams_ip",
+   "table": "cloud.office365.management.microsoftteams",
+   "filter": "ClientIP -> {T}",
+   "group": "UserId, Operation",
+   "accounts": [
+    "UserId"
+   ],
+   "note": "-> also catches ::ffff:a.b.c.d. Meeting/call participant rows hold private or .x-masked client IPs."
+  },
+  {
+   "by": "ip",
+   "name": "o365_onedrive_ip",
+   "table": "cloud.office365.management.onedrive",
+   "filter": "ClientIP -> {T}",
+   "group": "UserId, Operation",
+   "accounts": [
+    "UserId"
+   ],
+   "note": "batch-driven lag (check `devo.py lag`); back-fills repeat records: count with hllppcount(Id)."
+  },
+  {
+   "by": "ip",
+   "name": "o365_sharepoint_ip",
+   "table": "cloud.office365.management.sharepoint",
+   "filter": "ClientIP -> {T}",
+   "group": "UserId, Operation",
+   "accounts": [
+    "UserId"
+   ],
+   "note": "batch-driven lag (check `devo.py lag`); back-fills repeat records: count with hllppcount(Id)."
+  },
+  {
+   "by": "ip",
+   "name": "o365_threatintelligence_sender_ip",
+   "table": "cloud.office365.management.threatintelligence",
+   "filter": "SenderIp -> {T}",
+   "group": "P2Sender, Recipients, Verdict, DeliveryAction",
+   "accounts": [
+    "Recipients"
+   ],
+   "note": "Sender of flagged mail (not a client IP)."
+  },
+  {
+   "by": "ip",
+   "name": "dns_client_ip",
+   "table": "dns.windows",
+   "filter": "context = \"PACKET\", send_receive = \"Rcv\", query_response != \"R\", remote_ip = {T}",
+   "group": "hostname, question_dot, question_type, response_code",
+   "chunk": "1h",
+   "parallel": 6
+  },
+  {
+   "by": "ip",
+   "name": "s1_agents_ip",
+   "table": "edr.sentinelone.agent.agents",
+   "filter": "lastIpToMgmt = {T} or externalIp = {T}",
+   "group": "computerName, lastLoggedInUserName, lastIpToMgmt, externalIp, osName",
+   "note": "lastIpToMgmt = internal IP, externalIp = public egress; agents are snapshotted periodically"
+  },
+  {
+   "by": "ip",
+   "name": "s1_threats_ip",
+   "table": "edr.sentinelone.agent.threats",
+   "filter": "agentDetectionInfo__agentIpV4_str -> {T} or agentDetectionInfo__externalIp = {T}",
+   "group": "agentRealtimeInfo__agentComputerName, threatInfo__threatId, threatInfo__threatName"
+  },
+  {
+   "by": "ip",
+   "name": "s1_mgmt_ip",
+   "table": "edr.sentinelone.management.activities",
+   "filter": "dataIpAddress -> {T}",
+   "group": "activityType, dataComputerName, dataUsername",
+   "chunk": "10d",
+   "note": "dataIpAddress is stored with quote marks: use ->"
+  },
+  {
+   "by": "ip",
+   "name": "fortinet_admin_ip",
+   "table": "firewall.fortinet.event.system",
+   "filter": "srcIp = {T}",
+   "group": "devName, user, ui, action, status"
+  },
+  {
+   "by": "ip",
+   "name": "fortinet_ip",
+   "table": "firewall.fortinet.traffic.forward",
+   "filter": "srcIp = {T} or dstIp = {T} or natIp = {T}, logID = \"0000000013\"",
+   "group": "devName, srcIp, dstIp, dstPort, action",
+   "chunk": "30m",
+   "parallel": 4
+  },
+  {
+   "by": "ip",
+   "name": "devo_web_ip",
+   "table": "siem.logtrust.web.navigation",
+   "filter": "srcHost = {T}",
+   "group": "userEmail, section, action"
+  },
+  {
+   "by": "ip",
+   "name": "github_ent_ip",
+   "table": "vcs.github.enterprise.audit",
+   "filter": "actor_ipv4 = {T}",
+   "group": "actor, external_identity_username, action, programmatic_access_type"
+  },
+  {
+   "by": "ip",
+   "name": "github_org_ip",
+   "table": "vcs.github.organization.audit",
+   "filter": "actor_ip = {T}",
+   "group": "actor, external_identity_username, action",
+   "note": "127.0.0.6 = scheduled workflow runs"
+  },
+  {
+   "by": "ip",
+   "name": "zscaler_ip",
+   "table": "vpn.zscaler.access",
+   "filter": "ClientPrivateIp = {T} or ClientPublicIp = {T} or ServerIP = {T} or ConnectorIP = {T}",
+   "group": "Username, Hostname, ClientPrivateIp, ClientPublicIp, Host, ServerIP, ServerPort, ConnectorIP",
+   "chunk": "1h",
+   "parallel": 6
+  },
+  {
+   "by": "ip",
+   "name": "qualys_hosts_ip",
+   "table": "vuln.qualys.hosts",
+   "filter": "ip = {T}",
+   "group": "host_id, dns_fqdn, netbios, os, tracking_method"
+  },
+  {
+   "by": "ip",
+   "name": "qualys_users_ip",
+   "table": "vuln.qualys.useractivitylog",
+   "filter": "user_ip = {T}",
+   "group": "user_name, module, action"
+  },
+  {
+   "by": "host",
+   "name": "onepassword_device",
+   "table": "auth.agilebits.onepassword.signinattempt",
+   "filter": "weakhas(client__platform_name, {T})",
+   "group": "target_user__email, client__app_name, client__platform_name, client__ip_address",
+   "note": "client__platform_name is the device name only for the desktop apps and CLI"
+  },
+  {
+   "by": "host",
+   "name": "linux_logins_host",
+   "table": "box.unix",
+   "filter": "weakhas(machine, {T}), appName in {\"sshd\", \"sshd-session\", \"sudo\", \"su\"}",
+   "group": "machine, appName, account, src",
+   "chunk": "6h",
+   "pre": "peek(message, re(\"Accepted \\\\S+ for (\\\\S+) from\"), 1) as account, peek(message, re(\" from ([0-9a-fA-F:.]+) port\"), 1) as src"
+  },
+  {
+   "by": "host",
+   "name": "win_invalid_host",
+   "table": "box.win_nxlog.invalid",
+   "filter": "weakhas(host, {T})",
+   "select": "eventdate, host, rawMessage",
+   "note": "PowerShell 4104 blocks whose JSON was truncated (very large scripts) land here instead of box.win_nxlog.powershell; low volume, so use a long --from"
+  },
+  {
+   "by": "host",
+   "name": "win_powershell_host",
+   "table": "box.win_nxlog.powershell",
+   "filter": "weakhas(host, {T}), EventID in {4103, 4104}",
+   "group": "host, EventID, Path",
+   "chunk": "3h",
+   "parallel": 6
+  },
+  {
+   "by": "host",
+   "name": "win_security_host",
+   "table": "box.win_nxlog.security",
+   "filter": "weakhas(host, {T})",
+   "group": "host, EventID",
+   "chunk": "1h",
+   "parallel": 6
+  },
+  {
+   "by": "host",
+   "name": "win_security_logons_to_host",
+   "table": "box.win_nxlog.security",
+   "filter": "weakhas(host, {T}), EventID in {4624, 4625}",
+   "group": "EventID, TargetUserName, LogonType, AuthenticationPackageName",
+   "chunk": "1h",
+   "parallel": 6
+  },
+  {
+   "by": "host",
+   "name": "win_sysmon_host",
+   "table": "box.win_nxlog.sysmon",
+   "filter": "weakhas(host, {T})",
+   "group": "host, EventID, User, Image",
+   "chunk": "3h",
+   "parallel": 6
+  },
+  {
+   "by": "host",
+   "name": "win_system_host",
+   "table": "box.win_nxlog.system",
+   "filter": "weakhas(host, {T})",
+   "group": "host, EventID, SourceName",
+   "chunk": "1h",
+   "parallel": 6
+  },
+  {
+   "by": "host",
+   "name": "entra_noninteractive_device",
+   "table": "cloud.azure.ad.noninteractive_user_signin",
+   "filter": "weakhas(properties_deviceDetail_displayName, {T})",
+   "group": "properties_deviceDetail_displayName, properties_deviceDetail_deviceId, properties_userPrincipalName, properties_ipAddress",
+   "chunk": "3h",
+   "parallel": 6
+  },
+  {
+   "by": "host",
+   "name": "entra_signin_device",
+   "table": "cloud.azure.ad.signin",
+   "filter": "weakhas(properties_deviceDetail_displayName, {T})",
+   "group": "properties_deviceDetail_displayName, properties_deviceDetail_deviceId, properties_userPrincipalName, properties_ipAddress, properties_deviceDetail_trustType",
+   "note": "device name = Windows NetBIOS name (uppercase) for joined devices"
+  },
+  {
+   "by": "host",
+   "name": "defender_host_inventory",
+   "table": "cloud.azure.ah.device_info",
+   "filter": "weakhas(device_name, {T})",
+   "group": "device_id, device_name, os_platform, os_version, device_type, join_type, onboarding_status, sensor_health_state, public_ip"
+  },
+  {
+   "by": "host",
+   "name": "defender_host_logons",
+   "table": "cloud.azure.ah.device_logon_event",
+   "filter": "weakhas(device_name, {T})",
+   "group": "action_type, logon_type, account_domain, account_name, remote_ip"
+  },
+  {
+   "by": "host",
+   "name": "defender_host_connections",
+   "table": "cloud.azure.ah.device_network_event",
+   "filter": "weakhas(device_name, {T}), action_type in {\"ConnectionSuccess\", \"InboundConnectionAccepted\"}",
+   "group": "device_name, action_type, init_process_file_name, remote_ip, remote_port, remote_url",
+   "chunk": "6h",
+   "parallel": 4
+  },
+  {
+   "by": "host",
+   "name": "defender_host_processes",
+   "table": "cloud.azure.ah.device_process_event",
+   "filter": "weakhas(device_name, {T})",
+   "group": "device_name, account_name, file_name, init_process_file_name",
+   "chunk": "6h",
+   "parallel": 4
+  },
+  {
+   "by": "host",
+   "name": "s1_agents_host",
+   "table": "edr.sentinelone.agent.agents",
+   "filter": "weakhas(computerName, {T})",
+   "group": "computerName, id, uuid, lastLoggedInUserName, lastIpToMgmt, externalIp, osName, groupName"
+  },
+  {
+   "by": "host",
+   "name": "s1_threats_host",
+   "table": "edr.sentinelone.agent.threats",
+   "filter": "weakhas(agentRealtimeInfo__agentComputerName, {T})",
+   "group": "agentRealtimeInfo__agentComputerName, threatInfo__threatId, threatInfo__threatName, threatInfo__classification"
+  },
+  {
+   "by": "host",
+   "name": "s1_mgmt_host",
+   "table": "edr.sentinelone.management.activities",
+   "filter": "weakhas(dataComputerName, {T})",
+   "group": "dataComputerName, activityType, dataUsername",
+   "chunk": "10d"
+  },
+  {
+   "by": "host",
+   "name": "zscaler_host",
+   "table": "vpn.zscaler.access",
+   "filter": "weakhas(Host, {T}) or weakhas(Hostname, {T})",
+   "group": "Username, Hostname, Host, ServerIP, ServerPort, ConnectorIP",
+   "chunk": "3h",
+   "parallel": 8
+  },
+  {
+   "by": "host",
+   "name": "qualys_detections_host",
+   "table": "vuln.qualys.hostdetections",
+   "filter": "weakhas(dns_hostname, {T})",
+   "group": "host_id, ip, detection_qid, detection_severity, detection_status",
+   "note": "one row per detection per pull (several pulls a day): group, never count raw rows"
+  },
+  {
+   "by": "host",
+   "name": "qualys_hosts_host",
+   "table": "vuln.qualys.hosts",
+   "filter": "weakhas(dns_hostname, {T}) or weakhas(netbios, {T})",
+   "group": "host_id, ip, dns_fqdn, netbios, os"
+  }
+ ],
+ "graph": {
+  "name": "graph",
+  "table": "cloud.azure.ad.microsoft_graph_activity_logs",
+  "filter": "properties__user_id -> {T}",
+  "group": "properties__request_method, properties__request_uri, properties__response_status_code, properties__app_id, properties__ip_address_str",
+  "chunk": "1h",
+  "parallel": 7,
+  "note": "per object id (--graph-ids); ids are stored with quote marks, hence ->"
+ }
+}

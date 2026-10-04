@@ -1,0 +1,155 @@
+{
+ "_comment": "Event-time field per table family, for Devo's standard parsers: read by `devo.py lag`, `activity` (first_event/last_event, --rows) and `timeline`. `tables` is a regex on the table name (first match wins). `linq` is a LINQ expression giving the event time as a timestamp (null: the table has none, only eventdate = ingestion). `dedupe` lists the columns that together identify a record when it is ingested more than once. `lag` lists the tables `devo.py lag` measures by default (only those present in the domain). These are hints: on first use the helper test-runs each family's expression on a table the domain has, and families that fail fall back to eventdate (`devo.py cache status`).",
+ "families": [
+  {
+   "family": "Microsoft 365 (Power Platform)",
+   "tables": "^cloud\\.office365\\.management\\.powerplatform$",
+   "linq": "parsedate(str(jsonparse(rawMessage)[\"CreationTime\"]), \"YYYY-MM-DD[T]HH:mm:ss\", \"UTC\")",
+   "field": "CreationTime in rawMessage (UTC, no Z)",
+   "dedupe": [
+    "Id"
+   ],
+   "lag": []
+  },
+  {
+   "family": "Microsoft 365",
+   "tables": "^cloud\\.office365\\.management\\.",
+   "linq": "parsedate(str(jsonparse(message)[\"CreationTime\"]), \"YYYY-MM-DD[T]HH:mm:ss\", \"UTC\")",
+   "field": "CreationTime in message (UTC, no Z); Teams meetings: JoinTime/LeaveTime, StartTime/EndTime",
+   "dedupe": [
+    "Id"
+   ],
+   "lag": [
+    "cloud.office365.management.microsoftteams",
+    "cloud.office365.management.sharepoint",
+    "cloud.office365.management.onedrive",
+    "cloud.office365.management.exchange",
+    "cloud.office365.management.copilot",
+    "cloud.office365.management.azureactivedirectory",
+    "cloud.office365.management.powerbi"
+   ]
+  },
+  {
+   "family": "Windows (nxlog)",
+   "tables": "^box\\.win_nxlog\\.",
+   "linq": "timestamp",
+   "field": "timestamp (= EventTime from the host, converted to UTC)",
+   "dedupe": [],
+   "lag": [
+    "box.win_nxlog.security",
+    "box.win_nxlog.sysmon"
+   ]
+  },
+  {
+   "family": "Windows DNS",
+   "tables": "^dns\\.windows$",
+   "linq": "serverdate",
+   "field": "serverdate (blank on some rows)",
+   "dedupe": [],
+   "lag": [
+    "dns.windows"
+   ]
+  },
+  {
+   "family": "Fortinet",
+   "tables": "^firewall\\.fortinet\\.",
+   "linq": "serverdatetime",
+   "field": "serverdatetime (eventtime = the same in ns)",
+   "dedupe": [],
+   "lag": [
+    "firewall.fortinet.traffic.forward",
+    "firewall.fortinet.event.system"
+   ]
+  },
+  {
+   "family": "Entra sign-ins",
+   "tables": "^cloud\\.azure\\.ad\\.(signin|interactive_user_signin|noninteractive_user_signin|service_principal_signin|managed_identity_signin)$",
+   "linq": "parsedate(substring(properties_createdDateTime, 0, 19), \"YYYY-MM-DD[T]HH:mm:ss\", \"UTC\")",
+   "field": "properties_createdDateTime (not `timestamp`, which is later)",
+   "dedupe": [
+    "properties_id"
+   ],
+   "lag": [
+    "cloud.azure.ad.signin",
+    "cloud.azure.ad.noninteractive_user_signin"
+   ]
+  },
+  {
+   "family": "Entra audit",
+   "tables": "^cloud\\.azure\\.ad\\.audit$",
+   "linq": "properties_activityDateTime_timestamp",
+   "field": "properties_activityDateTime_timestamp",
+   "dedupe": [
+    "properties_id"
+   ],
+   "lag": [
+    "cloud.azure.ad.audit"
+   ]
+  },
+  {
+   "family": "Microsoft Graph activity",
+   "tables": "^cloud\\.azure\\.ad\\.microsoft_graph_activity_logs$",
+   "linq": "timestamp",
+   "field": "timestamp (= time)",
+   "dedupe": [],
+   "lag": [
+    "cloud.azure.ad.microsoft_graph_activity_logs"
+   ]
+  },
+  {
+   "family": "Defender (Advanced Hunting)",
+   "tables": "^cloud\\.azure\\.ah\\.",
+   "linq": "timestamp",
+   "field": "timestamp (not `time`, the Event Hub time)",
+   "dedupe": [
+    "device_id",
+    "report_id",
+    "timestamp"
+   ],
+   "lag": [
+    "cloud.azure.ah.device_process_event",
+    "cloud.azure.ah.device_network_event"
+   ]
+  },
+  {
+   "family": "GitHub",
+   "tables": "^vcs\\.github\\.",
+   "linq": "at_timestamp",
+   "field": "at_timestamp (@timestamp; created_at is blank on git.* events)",
+   "dedupe": [],
+   "lag": [
+    "vcs.github.enterprise.audit"
+   ]
+  },
+  {
+   "family": "Zscaler ZPA",
+   "tables": "^vpn\\.zscaler\\.",
+   "linq": "LogTimestamp",
+   "field": "LogTimestamp",
+   "dedupe": [],
+   "lag": [
+    "vpn.zscaler.access"
+   ]
+  },
+  {
+   "family": "1Password",
+   "tables": "^auth\\.agilebits\\.onepassword\\.",
+   "linq": "parsedate(substring(timestamp, 0, 19), \"YYYY-MM-DD[T]HH:mm:ss\", \"UTC\")",
+   "field": "timestamp (a string, ns precision)",
+   "dedupe": [],
+   "lag": [
+    "auth.agilebits.onepassword.signinattempt"
+   ]
+  },
+  {
+   "family": "Linux (box.unix)",
+   "tables": "^box\\.unix$",
+   "linq": null,
+   "field": "none: srceventdate and json_time are empty; only eventdate",
+   "dedupe": [],
+   "lag": [
+    "box.unix"
+   ]
+  }
+ ]
+}
