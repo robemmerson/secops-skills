@@ -1,0 +1,22 @@
+{
+  "name": "secops-skills",
+  "owner": {
+    "name": "Rob Emmerson",
+    "url": "https://github.com/robemmerson"
+  },
+  "description": "Rob Emmerson's security operations (SecOps) skills for Claude, packaged as Claude Code plugins.",
+  "plugins": [
+    {
+      "name": "devo",
+      "source": "./plugins/devo",
+      "category": "security",
+      "description": "Query Devo SIEM data with LINQ, investigate entities and triage Devo alerts (read-only, plus approved alert comments)."
+    },
+    {
+      "name": "dependency-updates",
+      "source": "./plugins/dependency-updates",
+      "category": "development",
+      "description": "Audit, update and harden dependencies with supply-chain safety: SHA-pinned GitHub Actions, digest-pinned container images and locked language packages, with a 72-hour release-age gate and call-site checks."
+    }
+  ]
+}

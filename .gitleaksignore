@@ -1,0 +1,3 @@
+# Public Devo API hostname ("api-us3.devo.com") in the region table, not a key. The line also
+# carries an inline gitleaks:allow; this entry covers scans that ignore inline markers.
+plugins/devo/skills/devo/scripts/devo.py:generic-api-key:55

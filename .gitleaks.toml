@@ -1,0 +1,9 @@
+# gitleaks: default rules, plus narrowly-scoped false-positive exclusions.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Devo's public SecOps detection library, quoted verbatim (IOC strings, script names)"
+paths = [
+  '''^plugins/devo/skills/devo/references/library/[a-z0-9-]+\.md$''',
+]

@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate marketplace, plugins and skills
+        run: python3 tools/validate.py
+
+      - name: Unit tests (tooling and every plugin with tests/)
+        run: |
+          python3 -m unittest discover -s tools/tests -v
+          for d in plugins/*/tests; do
+            echo "::group::$d"
+            python3 -m unittest discover -s "$d"
+            echo "::endgroup::"
+          done
+
+      - name: Build release zips (dry run)
+        run: |
+          for p in $(jq -r '.plugins[].name' .claude-plugin/marketplace.json); do
+            python3 tools/release.py zip "$p" dist
+          done
+          ls -l dist
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    # on pull_request the action lists the PR's commits via the API
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_VERSION: "8.30.1" # the scanner binary; bump deliberately
+          GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_ENABLE_COMMENTS: "false" # findings go to the job log/summary; no PR write access needed

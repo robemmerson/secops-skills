@@ -1,0 +1,71 @@
+name: Release
+
+# On every push to main that touches a plugin: work out each changed plugin's next version from
+# its Conventional Commits (tools/release.py), write it to plugin.json, commit, tag
+# `<plugin>-vX.Y.Z`, and publish a GitHub release with the Claude Desktop zip(s) attached.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "plugins/**"
+      - ".claude-plugin/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # the version-bump commit this job pushes must not release again
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore(release):') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Validate and test before releasing
+        run: |
+          python3 tools/validate.py
+          python3 -m unittest discover -s tools/tests
+          for d in plugins/*/tests; do python3 -m unittest discover -s "$d"; done
+
+      - name: Plan
+        id: plan
+        run: |
+          python3 tools/release.py plan > plan.json
+          cat plan.json
+          echo "count=$(jq length plan.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Version, tag and publish
+        if: steps.plan.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          # notes first: once tagged, the plan is empty
+          for p in $(jq -r '.[].plugin' plan.json); do
+            python3 tools/release.py notes "$p" > "dist/$p-notes.md"
+          done
+          python3 tools/release.py apply
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add plugins/*/.claude-plugin/plugin.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): $(jq -r '[.[] | "\(.plugin) v\(.version)"] | join(", ")' plan.json) [skip ci]"
+          fi
+          for t in $(jq -r '.[].tag' plan.json); do
+            git tag -a "$t" -m "$t"
+          done
+          git push origin HEAD:main --follow-tags
+
+          jq -r '.[] | "\(.plugin) \(.version) \(.tag)"' plan.json | while read -r p v t; do
+            python3 tools/release.py zip "$p" "dist/$p"
+            gh release create "$t" dist/"$p"/*.zip --title "$p v$v" --notes-file "dist/$p-notes.md"
+          done
