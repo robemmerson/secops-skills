@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Devo Query API and Alerts API helper. Python 3.8+, standard library only.
-Read-only except `comment`, which only posts with --confirm.
+"""Devo Query, Alerts and Activeboards API helper. Python 3.8+, standard library only.
+Read-only except `comment` and board-push/-set/-clone/-delete, which only send with --confirm.
 
 Commands:
   check                          verify the token and region
@@ -17,6 +17,12 @@ Commands:
   lag [--tables RE]              measure ingestion lag per table now
   batch <spec.json> --out-dir D  run many queries in parallel from a JSON/JSONL spec
   comment <id> --title T --msg M  preview a comment on a triggered alert; --confirm posts it
+  boards [--grep RE]             list Activeboards (dashboards)
+  board <id> [--out F]           one board's widgets and LINQ; --out exports it
+  board-new SPEC --out F         build a board file from a short widget spec (offline)
+  board-check F [--run]          lint a board file; --run test-runs every widget query
+  board-push F [--id ID]         create or replace a board; preview, --confirm sends
+  board-set|board-clone|board-delete <id>   flags and tags, copy, delete; preview, --confirm sends
   logons [--from 7d] [--os ...]   who logged into which Windows/Linux servers, per server and account
   health [--baseline 21d]        the whole domain: sources stopped/dropped/new, quiet senders, collector errors
   creds <batch dir>              summarise a credential-attack batch; writes the stage-2 spec (offline)
@@ -1446,6 +1452,580 @@ def cmd_comment(cfg, a):
     print(f"# posted and verified: comment {c.get('id', '?')} at {fmt_ms(c.get('creationDate'))} as {who}; "
           f"alert status unchanged ({status_label(after.get('status'))})", file=sys.stderr)
     return 0
+
+
+# ---------------------------------------------------------------- activeboards (dashboards)
+# Activeboards API v2 (references/dashboards-api.md). Reads are free; every write goes through
+# board_call() from a command that only sends with --confirm, after backing up what it replaces.
+
+BOARD_COLS = 12  # react-grid-layout columns the layout coordinates are expressed in
+BOARD_ID = re.compile(r"^\d+$")
+BOARD_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+BOARD_INPUT = re.compile(r"\$(\*?)([A-Za-z][A-Za-z0-9_]*)\.value\b")
+BOARD_GLOBAL = re.compile(r"\$[A-Z][A-Z_]+\b")  # $DOMAIN_NAME, $USER_NAME, $TIMEZONE ...
+
+
+def boards_url(cfg, path=""):
+    return f"https://{REGIONS[cfg['region']][1]}/activeboards/v2/{path}".rstrip("/")
+
+
+def board_call(cfg, method, path, body=None, timeout=60):
+    """One Activeboards API call; the parsed JSON body, or None for an empty one (DELETE: 204)."""
+    with http_open(method, boards_url(cfg, path), cfg["token"], body=body, timeout=timeout,
+                   headers={"standAloneToken": cfg["token"]}) as r:
+        text = r.read().decode("utf-8", "replace")
+    if not text.strip():
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        raise DevoError(f"unexpected non-JSON response from the Activeboards API: {text[:200]}",
+                        "a wrong path returns an HTML page; check the region (`devo.py check`)")
+
+
+def board_id(value):
+    if value != "default" and not BOARD_ID.match(value or ""):
+        raise DevoError(f"Activeboard id must be numeric (or 'default'), got {value!r}",
+                        "ids aren't shown in the Devo UI: list them with `devo.py boards`", code=1)
+    return value
+
+
+def board_get(cfg, bid):
+    b = board_call(cfg, "GET", f"activeboards/{board_id(bid)}")
+    if not isinstance(b, dict):
+        raise DevoError(f"Activeboard {bid}: unexpected response")
+    return b
+
+
+def board_nodes(node, path=()):
+    """Every element under a board's root container: (key, node, parent path), depth first."""
+    for key, child in ((node or {}).get("children") or {}).items():
+        if isinstance(child, dict):
+            yield key, child, path
+            yield from board_nodes(child, path + (key,))
+
+
+def board_layout(node):
+    return ((node or {}).get("settings") or {}).get("layout") or {}
+
+
+def board_query(datasource):
+    """The LINQ of a widget's datasource. Boards built in the UI store plain LINQ (`from t ...`); Devo's
+    docs wrap it in query(...), possibly inside take(query(...), 5). None when it is empty, unbalanced,
+    or the whole-query-from-an-input form query(Input0.value)."""
+    if not isinstance(datasource, str) or not datasource.strip():
+        return None
+    i = datasource.find("query(")
+    if i < 0 or re.match(r"\s*from\b", datasource):
+        return datasource.strip()
+    depth, quote, start = 0, None, i + len("query(")
+    for j in range(start - 1, len(datasource)):
+        c = datasource[j]
+        if quote:
+            if c == "\\":
+                continue
+            if c == quote and datasource[j - 1] != "\\":
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                inner = datasource[start:j].strip()
+                return None if re.fullmatch(r"[A-Za-z]\w*\.value", inner) else inner
+    return None  # unbalanced: board_lint reports it
+
+
+def board_widgets(settings):
+    """Flat list of a board's widgets and inputs with what an analyst needs to read them."""
+    out = []
+    containers = [(None, settings)] + [(k, n) for k, n, _ in board_nodes(settings) if n.get("type") == "container"]
+    layout = {}
+    for _, c in containers:
+        layout.update(board_layout(c))
+    for key, n, path in board_nodes(settings):
+        if n.get("type") == "container":
+            continue
+        ds = n.get("datasource")
+        out.append({"key": key, "name": n.get("name"), "type": n.get("type"), "subtype": n.get("subtype"),
+                    "parent": path[-1] if path else None, "layout": layout.get(key),
+                    "datasource": ds, "query": board_query(ds), "date": n.get("date") or {},
+                    "inputs": sorted({m.group(2) for m in BOARD_INPUT.finditer(ds or "")})})
+    return out
+
+
+def load_board_file(path):
+    """A board file: {name, description?, settings} as `board --out` writes it, or a bare settings
+    object (the UI's "Edit raw configuration" JSON). Returns (doc, settings)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except OSError as e:
+        raise DevoError(f"cannot read {path}: {e.strerror}", code=1)
+    except ValueError as e:
+        raise DevoError(f"{path} is not valid JSON: {e}", code=1)
+    if not isinstance(doc, dict):
+        raise DevoError(f"{path}: expected a JSON object", code=1)
+    if isinstance(doc.get("settings"), dict) and doc.get("type") != "container":
+        return doc, doc["settings"]
+    return {"settings": doc}, doc
+
+
+def board_lint(settings):
+    """Structural problems in a board definition: (errors, warnings). Offline."""
+    errs, warns = [], []
+    if settings.get("type") != "container":
+        errs.append('root: "type" must be "container" (is this the settings object of a board?)')
+    if settings.get("subtype") != "Grid":
+        warns.append(f'root: subtype {settings.get("subtype")!r}; boards built in the UI use "Grid"')
+    date = settings.get("date") or {}
+    if not date.get("from") or not date.get("to"):
+        warns.append('root: no "date" {from, to}; the UI opens it on its default range')
+    if settings.get("version") != 3:
+        warns.append(f"root: version {settings.get('version')!r}; the documented format is version 3")
+    nodes = list(board_nodes(settings))
+    if not nodes:
+        errs.append("the board has no widgets (root children is empty)")
+    keys = [k for k, _, _ in nodes]
+    for k in sorted({k for k in keys if keys.count(k) > 1}):
+        errs.append(f"{k}: element id used more than once")
+    for owner, node in [("root", settings)] + [(k, n) for k, n, _ in nodes if n.get("type") == "container"]:
+        children = set((node.get("children") or {}).keys())
+        lay = board_layout(node)
+        for k in sorted(children - set(lay)):
+            errs.append(f"{k}: no layout entry in {owner} settings.layout (it would not be placed)")
+        for k in sorted(set(lay) - children):
+            warns.append(f"{owner} settings.layout has {k!r}, which is not a child (stale entry)")
+        for k, cell_ in lay.items():
+            if not isinstance(cell_, dict):
+                errs.append(f"{k}: layout entry is not an object")
+                continue
+            if cell_.get("i") not in (None, k):
+                errs.append(f"{k}: layout.i is {cell_.get('i')!r}, must equal the element id")
+            nums = {d: cell_.get(d) for d in ("x", "y", "w", "h")}
+            if any(not isinstance(v, int) or v < 0 for v in nums.values()):
+                errs.append(f"{k}: layout x/y/w/h must be non-negative integers, got {nums}")
+            elif nums["w"] == 0 or nums["h"] == 0 or nums["x"] + nums["w"] > BOARD_COLS:
+                warns.append(f"{k}: layout {nums} doesn't fit a {BOARD_COLS}-column grid")
+    for k, n, _ in nodes:
+        if not BOARD_KEY.match(k):
+            warns.append(f"{k!r}: element ids in UI-built boards are identifiers like Table0 (letters, digits, _)")
+        if n.get("type") not in ("widget", "input", "container"):
+            warns.append(f"{k}: unknown element type {n.get('type')!r}")
+        if not n.get("subtype"):
+            errs.append(f"{k}: no subtype (Table, Line, Input ...)")
+        if n.get("type") != "widget":
+            continue
+        ds = n.get("datasource")
+        if not isinstance(ds, str) or not ds.strip():
+            errs.append(f"{k}: no datasource (the widget's LINQ query)")
+        elif board_query(ds) is None and not re.search(r"query\(\s*[A-Za-z]\w*\.value\s*\)", ds):
+            errs.append(f"{k}: unbalanced parentheses or quotes in the datasource")
+        for m in BOARD_INPUT.finditer(ds or ""):
+            if m.group(2) not in keys:
+                errs.append(f"{k}: refers to ${m.group(1)}{m.group(2)}.value but the board has no element {m.group(2)}")
+    return errs, warns
+
+
+def board_fill_inputs(linq, values):
+    """Replace $Input0.value (a formatted value: quoted unless numeric) and $*Input0.value (raw) with
+    the --input values. Returns (linq, missing input names)."""
+    missing = set()
+
+    def sub(m):
+        raw, name = m.group(1), m.group(2)
+        if name not in values:
+            missing.add(name)
+            return m.group(0)
+        v = values[name]
+        if raw or re.fullmatch(r"-?\d+(\.\d+)?", v):
+            return v
+        return json.dumps(v)
+
+    return BOARD_INPUT.sub(sub, linq), missing
+
+
+def board_summary_line(b):
+    flags = "".join(c for c, on in (("P", b.get("isPrivate")), ("D", b.get("isDefault")),
+                                     ("F", b.get("favorite"))) if on)
+    owner = (b.get("owner") or {}).get("username") or "?"
+    tags = ",".join(b.get("tags") or [])
+    return (f"{b.get('id')}  {fmt_ms(b.get('updateDate'))}  [{flags or '-'}]  {b.get('name')}"
+            + (f"  tags={tags}" if tags else "") + f"  owner={owner}")
+
+
+def cmd_boards(cfg, a):
+    """List the domain's Activeboards (Devo's dashboards) visible to the token's user."""
+    items = board_call(cfg, "GET", "activeboards") or []
+    if a.grep:
+        rx = re.compile(a.grep, re.I)
+        items = [b for b in items if rx.search(" ".join(str(b.get(k) or "") for k in ("name", "description"))
+                                               + " " + " ".join(b.get("tags") or []))]
+    items.sort(key=lambda b: b.get("updateDate") or 0, reverse=True)
+    if a.format == "json":
+        print(json.dumps(items, indent=1, ensure_ascii=False))
+    else:
+        for b in items:
+            print(board_summary_line(b))
+    print(f"# {len(items)} Activeboard(s); flags P private, D default, F favourite",
+          file=sys.stderr)
+    return 0
+
+
+def board_export(b):
+    """What `board --out` writes: ready for `board-push` (and for `board-check`)."""
+    return {"name": b.get("name"), "description": b.get("description") or "", "settings": b.get("settings"),
+            "exported_from": {"id": b.get("id"), "updateDate": b.get("updateDate")}}
+
+
+def cmd_board(cfg, a):
+    """One Activeboard: its widgets, their types, layout and LINQ; --out exports it for board-push."""
+    b = board_get(cfg, a.id)
+    if a.out:
+        write_private_file(a.out, json.dumps(board_export(b), indent=1, ensure_ascii=False) + "\n")
+        print(f"# exported Activeboard {b.get('id')} to {a.out} (edit it, `board-check` it, then `board-push`)",
+              file=sys.stderr)
+    if a.json:
+        print(json.dumps(b, indent=1, ensure_ascii=False))
+        return 0
+    s = b.get("settings") or {}
+    print(board_summary_line(b))
+    if b.get("description"):
+        print(f"  {b['description']}")
+    d = s.get("date") or {}
+    refresh = (s.get("extra") or {}).get("autoRefreshPeriod")
+    print(f"  range {d.get('from')} → {d.get('to')}" + ("  (real time)" if d.get("realTime") else "")
+          + (f"  auto-refresh {refresh}" if refresh else ""))
+    for w in board_widgets(s):
+        lay = w["layout"] or {}
+        pos = f"x{lay.get('x')} y{lay.get('y')} {lay.get('w')}x{lay.get('h')}" if lay else "no layout"
+        print(f"\n[{w['key']}] {w['subtype']} ({w['type']})  {pos}"
+              + (f"  in {w['parent']}" if w["parent"] else "")
+              + (f"  own range {w['date'].get('from')} → {w['date'].get('to')}" if w["date"].get("from") else ""))
+        if w["type"] == "widget" or w["datasource"]:
+            for line in (w["datasource"] or "(no datasource)").splitlines():
+                print(f"    {line}")
+    return 0
+
+
+def write_private_file(path, text):
+    d = os.path.dirname(os.path.abspath(path))
+    if os.path.commonpath([d, SKILL_DIR]) == SKILL_DIR:
+        raise DevoError("don't write board exports inside the skill directory", code=1)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def cmd_board_check(cfg, a):
+    """Lint a board file offline; with --run, run each widget's LINQ through the Query API (read-only)."""
+    doc, settings = load_board_file(a.file)
+    errs, warns = board_lint(settings)
+    widgets = board_widgets(settings)
+    print(f"{a.file}: {doc.get('name') or '(no name: board-push needs --name)'}, "
+          f"{sum(w['type'] == 'widget' for w in widgets)} widget(s), {sum(w['type'] == 'input' for w in widgets)} input(s)")
+    for e in errs:
+        print(f"ERROR   {e}")
+    for w in warns:
+        print(f"warning {w}")
+    values = parse_vars(a.input or [])
+    failed = len(errs)
+    if a.run:
+        if cfg is None:
+            raise DevoError("--run needs credentials", code=1)
+        d = settings.get("date") or {}
+        frm_s, to_s = a.from_ or d.get("from") or "15m", a.to or d.get("to") or "now"
+        if not (a.from_ or d.get("from")):
+            print("# no board range: running the widgets over the last 15 minutes", file=sys.stderr)
+        for w in widgets:
+            if w["type"] != "widget":
+                continue
+            if w["query"] is None:
+                print(f"skip    {w['key']}: its query comes from an input (query(X.value))")
+                continue
+            linq, missing = board_fill_inputs(w["query"], values)
+            if missing:
+                print(f"skip    {w['key']}: needs --input {','.join(f'{m}=...' for m in sorted(missing))}")
+                continue
+            if BOARD_GLOBAL.search(linq):
+                print(f"skip    {w['key']}: uses a board global variable ({BOARD_GLOBAL.search(linq).group(0)})")
+                continue
+            wd = w["date"] or {}
+            wf, wt = (wd.get("from"), wd.get("to")) if wd.get("from") and not a.from_ else (frm_s, to_s)
+            for table, names in unknown_fields(linq, cfg):
+                print(f"warning {w['key']}: {table} has no field(s) {', '.join(names)} in the cached schema")
+            t0 = time.time()
+            try:
+                frm, to = resolve_time(wf)[0], resolve_time(wt)[0]
+                columns, rows = collect(cfg, linq, frm, to, a.limit, a.timeout)
+            except DevoError as e:
+                failed += 1
+                print(f"FAIL    {w['key']}: {e}" + (f"\n        hint: {e.hint}" if e.hint else ""))
+                continue
+            names = [c[0] for c in (columns or [])]
+            print(f"ok      {w['key']}: {len(rows)} row(s) in {time.time() - t0:.1f}s over {wf} → {wt}"
+                  + (f"; columns {', '.join(names)}" if names else "")
+                  + ("; 0 rows: check filters and range before publishing" if not rows else ""))
+    print(f"# {len(errs)} error(s), {len(warns)} warning(s)" + (f", {failed - len(errs)} failed query(ies)" if a.run else ""),
+          file=sys.stderr)
+    return 2 if failed else 0
+
+
+# subtype strings seen in boards built in the UI [verified]; others exist (export one to learn its name)
+BOARD_SUBTYPES_KNOWN = {"Table", "Line", "Column", "Pie", "Voronoi", "DependencyWheel", "SimpleValue"}
+
+
+def cmd_board_new(cfg, a):
+    """Build a board file from a short spec (offline): the boilerplate, the layout and the query(...) wrapping."""
+    try:
+        with open(a.spec, encoding="utf-8") as f:
+            spec = json.load(f)
+    except (OSError, ValueError) as e:
+        raise DevoError(f"cannot read spec {a.spec}: {e}", code=1)
+    if not isinstance(spec, dict) or not isinstance(spec.get("widgets"), list) or not spec["widgets"]:
+        raise DevoError('spec must be {"name", "widgets": [{"id", "type", "query", ...}, ...]}', code=1)
+    templates = {}
+    if a.template:
+        _, tset = load_board_file(a.template)
+        for k, n, _ in board_nodes(tset):
+            templates.setdefault(n.get("subtype"), n)
+    children, layout, x, y, row_h = {}, {}, 0, 0, 0
+    counters = {}
+    for i, w in enumerate(spec["widgets"]):
+        sub = w.get("type") or "Table"
+        if sub == "Input":
+            kind = "input"
+        else:
+            kind = "widget"
+            if not w.get("query"):
+                raise DevoError(f"widget {i + 1}: no query", code=1)
+        key = w.get("id")
+        if not key:
+            key = f"{sub}{counters.get(sub, 0)}"
+            counters[sub] = counters.get(sub, 0) + 1
+        if not BOARD_KEY.match(key) or key in children:
+            raise DevoError(f"widget {i + 1}: id {key!r} must be unique and an identifier (letters, digits, _)", code=1)
+        tpl = templates.get(sub) or {}
+        if sub not in BOARD_SUBTYPES_KNOWN and sub != "Input" and not tpl:
+            print(f"# {key}: subtype {sub!r} is not a known widget type (known: "
+                  f"{', '.join(sorted(BOARD_SUBTYPES_KNOWN))}); export a UI-built example and pass --template",
+                  file=sys.stderr)
+        elif sub not in ("Table", "Input") and not tpl and "settings" not in w:
+            print(f"# {key}: {sub} widgets map columns to axes/series in their settings; until they are set "
+                  f"(in the UI's widget editor, or copied with --template) the widget may render empty",
+                  file=sys.stderr)
+        q = w.get("query")
+        ds = None
+        if q:
+            q = q.strip()
+            ds = q  # plain LINQ, as the UI stores it; query(...)/take(...) forms are kept as written
+        node = {"name": w.get("title") or key, "description": w.get("description") or "", "type": kind,
+                "subtype": sub, "datasource": ds, "definitions": None,
+                "date": {k: v for k, v in (("from", w.get("from")), ("to", w.get("to"))) if v},
+                "settings": json.loads(json.dumps(w.get("settings", tpl.get("settings") or {}))),
+                "extra": {"lastMetadata": []}, "children": None, "version": 3}
+        if node["date"]:
+            node["date"]["realTime"] = False
+        wd, hd = int(w.get("w", 6)), int(w.get("h", 2 if kind == "input" else 10))
+        if "x" in w or "y" in w:
+            cx, cy = int(w.get("x", 0)), int(w.get("y", 0))
+        else:
+            if x + wd > BOARD_COLS:
+                x, y, row_h = 0, y + row_h, 0
+            cx, cy = x, y
+            x, row_h = x + wd, max(row_h, hd)
+        children[key] = node
+        layout[key] = {"w": wd, "h": hd, "x": cx, "y": cy, "i": key, "moved": False, "static": False}
+    settings = {"description": spec.get("description") or "", "type": "container", "subtype": "Grid",
+                "datasource": None, "definitions": None,
+                "date": {"realTime": False, "from": spec.get("from") or "now() - 1d", "to": spec.get("to") or "now()"},
+                "settings": {"layout": layout, "header": False},
+                "extra": {"favourites": {"widgets": "Line", "inputs": "Input", "containers": "Grid"},
+                          "autoRefreshPeriod": spec.get("refresh"), "config": {"theme": {}}},
+                "children": children, "version": 3}
+    doc = {"name": spec.get("name") or "", "description": spec.get("description") or "", "settings": settings}
+    errs, warns = board_lint(settings)
+    for e in errs:
+        print(f"ERROR   {e}", file=sys.stderr)
+    for w in warns:
+        print(f"warning {w}", file=sys.stderr)
+    write_private_file(a.out, json.dumps(doc, indent=1, ensure_ascii=False) + "\n")
+    print(f"# wrote {a.out}: {len(children)} element(s); next: `board-check {a.out} --run`, then `board-push {a.out}`",
+          file=sys.stderr)
+    return 1 if errs else 0
+
+
+def board_backup(b):
+    """Save a board's full definition in the private domain cache before replacing or deleting it."""
+    if not CACHE:
+        raise DevoError("no domain cache to keep a backup in; refusing to overwrite or delete without one", code=1)
+    d = os.path.join(CACHE.dir, "board-backups")
+    CACHE.mkdirs(d)
+    path = os.path.join(d, f"{b.get('id')}-{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}.json")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(board_export(b), f, indent=1, ensure_ascii=False)
+    return path
+
+
+def board_diff(old, new):
+    """Widget-level differences between two settings objects: lines for the preview."""
+    o = {w["key"]: w for w in board_widgets(old or {})}
+    n = {w["key"]: w for w in board_widgets(new or {})}
+    lines = [f"  + {k} ({n[k]['subtype']})" for k in n if k not in o]
+    lines += [f"  - {k} ({o[k]['subtype']})" for k in o if k not in n]
+    for k in n.keys() & o.keys():
+        what = [f for f in ("subtype", "datasource", "layout", "date") if n[k][f] != o[k][f]]
+        if what:
+            lines.append(f"  ~ {k}: {', '.join(what)} changed")
+    for f in ("date",):
+        if (old or {}).get(f) != (new or {}).get(f):
+            lines.append(f"  ~ board {f}: {(old or {}).get(f)} → {(new or {}).get(f)}")
+    return sorted(lines, key=lambda s: s[4:]) or ["  (no widget changes)"]
+
+
+NOT_SENT = "# NOT SENT (preview). Show this to the user; re-run with --confirm only after they approve it."
+
+
+def cmd_board_push(cfg, a):
+    """Create a board from a file (POST), or replace board --id with it (PUT, the whole definition)."""
+    doc, settings = load_board_file(a.file)
+    name = a.name or doc.get("name")
+    if not name:
+        raise DevoError("the board needs a name: --name, or \"name\" in the file", code=1)
+    errs, warns = board_lint(settings)
+    if errs:
+        for e in errs:
+            print(f"ERROR   {e}", file=sys.stderr)
+        raise DevoError(f"{len(errs)} error(s) in {a.file}; fix them first (`devo.py board-check`)", code=1)
+    body = {"name": name, "description": a.description if a.description is not None else doc.get("description") or "",
+            "settings": settings}
+    widgets = board_widgets(settings)
+    current = None
+    if a.id:
+        current = board_get(cfg, a.id)
+        print(f"PUT {boards_url(cfg, 'activeboards/' + a.id)}  (replaces the whole board)")
+        print(f"  current: {board_summary_line(current)}")
+        exp = doc.get("exported_from") or {}
+        if exp.get("id") and str(exp["id"]) != str(current.get("id")):
+            print(f"  WARNING: the file was exported from board {exp['id']}, not {a.id}", file=sys.stderr)
+        if exp.get("updateDate") and current.get("updateDate") and exp["updateDate"] != current["updateDate"]:
+            print(f"  WARNING: board {a.id} changed since the export ({fmt_ms(exp['updateDate'])} → "
+                  f"{fmt_ms(current['updateDate'])}): those edits would be lost; re-export and merge", file=sys.stderr)
+        if current.get("name") != name:
+            print(f"  name: {current.get('name')!r} → {name!r}")
+        print("\n".join(board_diff(current.get("settings"), settings)))
+    else:
+        print(f"POST {boards_url(cfg, 'activeboards')}  (new board, private to the token's user)")
+    print(f"  name: {name}\n  widgets: " + ", ".join(f"{w['key']} ({w['subtype']})" for w in widgets))
+    for w in warns:
+        print(f"  warning {w}", file=sys.stderr)
+    if not a.confirm:
+        print(NOT_SENT, file=sys.stderr)
+        return 0
+    if current is not None:
+        print(f"# backup of the current board: {board_backup(current)}", file=sys.stderr)
+        res = board_call(cfg, "PUT", f"activeboards/{a.id}", body=body)
+    else:
+        res = board_call(cfg, "POST", "activeboards", body=body)
+    bid = (res or {}).get("id") or a.id
+    if not bid:
+        raise DevoError(f"Devo accepted the board but returned no id: {str(res)[:200]}",
+                        "find it with `devo.py boards --grep <name>`")
+    after = board_get(cfg, str(bid))
+    got = {w["key"] for w in board_widgets(after.get("settings") or {})}
+    want = {w["key"] for w in widgets}
+    if got != want:
+        raise DevoError(f"board {bid} saved, but its widgets read back differently: missing {sorted(want - got)}, "
+                        f"extra {sorted(got - want)}", f"inspect with `devo.py board {bid}`")
+    print(f"# {'updated' if current is not None else 'created'} and verified: Activeboard {bid} "
+          f"'{after.get('name')}' with {len(got)} element(s)"
+          + ("; it is private: `board-set --private false` and share with roles in the UI" if after.get("isPrivate")
+             else ""), file=sys.stderr)
+    return 0
+
+
+def parse_bool(v):
+    if v.lower() in ("true", "yes", "on", "1"):
+        return True
+    if v.lower() in ("false", "no", "off", "0"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected true/false, got {v!r}")
+
+
+def cmd_board_set(cfg, a):
+    """Change a board's privacy, tags, favourite or default flag (one PATCH each)."""
+    bid = board_id(a.id)
+    changes = []
+    if a.private is not None:
+        changes.append(("privacy", {"privacy": a.private}, "isPrivate", a.private))
+    if a.tags is not None:
+        tags = ", ".join(t.strip() for t in a.tags.split(",") if t.strip())
+        changes.append(("tags", {"tags": tags}, "tags", [t.strip() for t in tags.split(",") if t.strip()]))
+    if a.favorite is not None:
+        changes.append(("favorite", {"favorite": a.favorite}, "favorite", a.favorite))
+    if a.default is not None:
+        changes.append(("default", {"markAsDefault": a.default}, "isDefault", a.default))
+    if not changes:
+        raise DevoError("nothing to change: give --private, --tags, --favorite or --default", code=1)
+    b = board_get(cfg, bid)
+    print(f"board: {board_summary_line(b)}")
+    for attr, body, field, _ in changes:
+        print(f"PATCH {boards_url(cfg, f'activeboards/{bid}/{attr}')}  {json.dumps(body)}  "
+              f"(now {field}={b.get(field)!r})")
+    if not a.confirm:
+        print(NOT_SENT, file=sys.stderr)
+        return 0
+    for attr, body, _, _ in changes:
+        board_call(cfg, "PATCH", f"activeboards/{bid}/{attr}", body=body)
+    after = board_get(cfg, bid)
+    off = [f"{field}={after.get(field)!r} (wanted {want!r})" for _, _, field, want in changes
+           if field != "tags" and after.get(field) != want]
+    if off:
+        raise DevoError("Devo accepted the change but the board reads back " + "; ".join(off))
+    print(f"# changed and verified: {board_summary_line(after)}", file=sys.stderr)
+    return 0
+
+
+def cmd_board_clone(cfg, a):
+    """Copy a board under a new name (the copy belongs to the token's user)."""
+    bid = board_id(a.id)
+    b = board_get(cfg, bid)
+    body = {"name": a.name, "description": a.description if a.description is not None else b.get("description") or ""}
+    print(f"POST {boards_url(cfg, f'activeboards/{bid}/clone')}  {json.dumps(body, ensure_ascii=False)}")
+    print(f"  source: {board_summary_line(b)}")
+    if not a.confirm:
+        print(NOT_SENT, file=sys.stderr)
+        return 0
+    res = board_call(cfg, "POST", f"activeboards/{bid}/clone", body=body) or {}
+    print(f"# cloned: Activeboard {res.get('id', '?')} '{res.get('name', a.name)}'", file=sys.stderr)
+    return 0
+
+
+def cmd_board_delete(cfg, a):
+    """Delete a board (after saving a backup of it in the domain cache)."""
+    bid = board_id(a.id)
+    if bid == "default":
+        raise DevoError("give the numeric id, not 'default', to delete a board", code=1)
+    b = board_get(cfg, bid)
+    print(f"DELETE {boards_url(cfg, f'activeboards/{bid}')}")
+    print(f"  board: {board_summary_line(b)}")
+    print(f"  widgets: {len(board_widgets(b.get('settings') or {}))}; others may use it if it isn't private")
+    if not a.confirm:
+        print(NOT_SENT, file=sys.stderr)
+        return 0
+    print(f"# backup: {board_backup(b)} (recreate with `devo.py board-push <backup>`)", file=sys.stderr)
+    board_call(cfg, "DELETE", f"activeboards/{bid}")
+    try:
+        board_get(cfg, bid)
+    except DevoError as e:
+        if "404" in str(e):
+            print(f"# deleted and verified: Activeboard {bid} is gone", file=sys.stderr)
+            return 0
+        raise
+    raise DevoError(f"Devo accepted the delete but board {bid} still reads back")
 
 
 # ---------------------------------------------------------------- coverage
@@ -6116,6 +6696,72 @@ def build_parser():
                    help="actually post it; only after the user approved the previewed text")
     s.set_defaults(fn=cmd_comment)
 
+    s = sub.add_parser("boards", help="list Activeboards (dashboards): id, updated, flags, name, tags, owner")
+    s.add_argument("--grep", help="regex on name, description and tags (case-insensitive)")
+    s.add_argument("--format", choices=["table", "json"], default="table")
+    s.set_defaults(fn=cmd_boards)
+
+    s = sub.add_parser("board", help="one Activeboard: widgets, types, layout and LINQ; --out exports it",
+                       description=cmd_board.__doc__)
+    s.add_argument("id", help="numeric id (from `boards`) or 'default'")
+    s.add_argument("--json", action="store_true", help="the raw API object")
+    s.add_argument("--out", help="write {name, description, settings} for board-check / board-push")
+    s.set_defaults(fn=cmd_board)
+
+    s = sub.add_parser("board-new", help="build a board file from a short widget spec (offline)",
+                       description=cmd_board_new.__doc__ + ' Spec: {"name", "description"?, "from"?, "to"?, '
+                       '"refresh"?, "widgets": [{"id"?, "type": "Table|Line|Input|...", "query": "<LINQ>", '
+                       '"title"?, "w"?, "h"?, "x"?, "y"?, "from"?, "to"?, "settings"?}]}. Layout: 12 columns, '
+                       'widgets placed left to right (default 6x10) unless x/y are given.')
+    s.add_argument("spec")
+    s.add_argument("--out", required=True, help="board file to write")
+    s.add_argument("--template", help="an exported board whose widget settings to reuse per subtype "
+                                      "(for chart types whose settings Devo doesn't document)")
+    s.set_defaults(fn=cmd_board_new)
+
+    s = sub.add_parser("board-check", help="lint a board file; --run runs each widget's query (read-only)",
+                       description=cmd_board_check.__doc__)
+    s.add_argument("file")
+    s.add_argument("--run", action="store_true", help="run every widget query through the Query API")
+    s.add_argument("--input", action="append", metavar="NAME=VALUE",
+                   help="value for $NAME.value / $*NAME.value board inputs (repeatable, or a,b)")
+    s.add_argument("--from", dest="from_", help="override the board's range for --run")
+    s.add_argument("--to")
+    s.add_argument("--limit", type=int, default=50, help="rows per widget query (default 50)")
+    s.add_argument("--timeout", type=int, default=300)
+    s.set_defaults(fn=cmd_board_check)
+
+    s = sub.add_parser("board-push", help="create (POST) or replace (--id, PUT) a board from a file "
+                                          "(preview; --confirm sends)", description=cmd_board_push.__doc__)
+    s.add_argument("file")
+    s.add_argument("--id", help="replace this board (default: create a new one)")
+    s.add_argument("--name")
+    s.add_argument("--description")
+    s.add_argument("--confirm", action="store_true", help="send it; only after the user approved the preview")
+    s.set_defaults(fn=cmd_board_push)
+
+    s = sub.add_parser("board-set", help="set a board's privacy, tags, favourite or default flag "
+                                         "(preview; --confirm sends)", description=cmd_board_set.__doc__)
+    s.add_argument("id")
+    s.add_argument("--private", type=parse_bool, help="true = private, false = visible (shareable in the UI)")
+    s.add_argument("--tags", help="comma-separated; replaces the board's tags")
+    s.add_argument("--favorite", type=parse_bool)
+    s.add_argument("--default", type=parse_bool, help="mark as the user's default board")
+    s.add_argument("--confirm", action="store_true")
+    s.set_defaults(fn=cmd_board_set)
+
+    s = sub.add_parser("board-clone", help="copy a board under a new name (preview; --confirm sends)")
+    s.add_argument("id")
+    s.add_argument("--name", required=True)
+    s.add_argument("--description")
+    s.add_argument("--confirm", action="store_true")
+    s.set_defaults(fn=cmd_board_clone)
+
+    s = sub.add_parser("board-delete", help="delete a board, keeping a local backup (preview; --confirm sends)")
+    s.add_argument("id")
+    s.add_argument("--confirm", action="store_true")
+    s.set_defaults(fn=cmd_board_delete)
+
     s = sub.add_parser("creds", help="summarise a credential-attack batch (spray / distributed brute force) and "
                                      "write the stage-2 'did anything succeed' spec (offline)",
                        description=cmd_creds.__doc__)
@@ -6222,7 +6868,7 @@ def main(argv=None):
     try:
         if (a.fn is cmd_fields and a.map) or a.fn is cmd_creds:  # local files only
             cfg = None
-        elif a.fn in (cmd_timeline, cmd_grants):  # offline; the credentials only locate the cache
+        elif a.fn in (cmd_timeline, cmd_grants, cmd_board_new) or (a.fn is cmd_board_check and not a.run):  # offline; the credentials only locate the cache
             try:
                 cfg = load_config()
             except DevoError:
