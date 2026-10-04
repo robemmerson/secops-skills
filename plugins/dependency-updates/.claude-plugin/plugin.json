@@ -1,0 +1,10 @@
+{
+  "name": "dependency-updates",
+  "version": "1.0.0",
+  "description": "Audit, update and harden dependencies with supply-chain safety: SHA-pinned GitHub Actions, digest-pinned container images and locked language packages, with a 72-hour release-age gate and call-site checks.",
+  "author": {
+    "name": "Rob Emmerson",
+    "url": "https://github.com/robemmerson"
+  },
+  "repository": "https://github.com/robemmerson/secops-skills"
+}
