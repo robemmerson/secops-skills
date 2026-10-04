@@ -1,5 +1,5 @@
 {
- "_comment": "Sweep recipes for `devo.py activity <term> --by user|ip|host`, for Devo's standard tables. Each source has `by` (which sweep), `table`, `filter` ({T} is replaced with the quoted term), optional `pre` (a select clause run before grouping, e.g. peek() on Message), either `group` (grouped with count/first/last, re-aggregated across chunks) or `select`, optional `chunk`/`parallel`, `accounts` (fields shown under 'entities seen'; when absent, any value containing the term), and `note`. These are hints, not facts about your domain: on first use the helper keeps only the sources whose table exists in the domain and whose fields are in the table's live schema, adds generated sources for other tables with user/IP/host fields, and caches the result (`devo.py cache status`).",
+ "_comment": "Sweep recipes for `devo.py activity <term> --by user|ip|host`, for Devo's standard tables. Each source has `by` (which sweep), `table`, `filter` ({T} is replaced with the quoted term), optional `pre` (a select clause run before grouping, e.g. peek() on Message), either `group` (grouped with count/first/last, re-aggregated across chunks) or `select`, optional `chunk`/`parallel`, `accounts` (fields shown under 'entities seen'; when absent, any value containing the term), optional `actor` and `target` (the fields `timeline` puts in those slots, in preference order; `actor` defaults to `accounts` for user sweeps, so set it when `accounts` also lists a target field), and `note`. These are hints, not facts about your domain: on first use the helper keeps only the sources whose table exists in the domain and whose fields are in the table's live schema, adds generated sources for other tables with user/IP/host fields, and caches the result (`devo.py cache status`).",
  "sources": [
   {
    "by": "user",
@@ -9,6 +9,12 @@
    "group": "actor_details__email, aux_details__email, action, object_type, session__ip",
    "accounts": [
     "actor_details__email",
+    "aux_details__email"
+   ],
+   "actor": [
+    "actor_details__email"
+   ],
+   "target": [
     "aux_details__email"
    ],
    "note": "dlgsess/ssotknv rows are session plumbing; the rest are admin/item changes"
@@ -208,6 +214,14 @@
    "accounts": [
     "properties_initiatedBy_user_userPrincipalName"
    ],
+   "actor": [
+    "properties_initiatedBy_user_userPrincipalName",
+    "properties_initiatedBy_app_displayName"
+   ],
+   "target": [
+    "target_upn",
+    "target_name"
+   ],
    "by": "user",
    "pre": "str(jqeval(jqcompile(\".[0].userPrincipalName\"), properties_targetResources)) as target_upn, str(jqeval(jqcompile(\".[0].displayName\"), properties_targetResources)) as target_name",
    "note": "target_upn/target_name = the first target (a #EXT# UPN is a B2B guest)"
@@ -220,6 +234,10 @@
    "group": "operationName, properties_loggedByService, properties_initiatedBy_user_userPrincipalName, properties_initiatedBy_app_displayName",
    "accounts": [
     "properties_initiatedBy_user_userPrincipalName"
+   ],
+   "actor": [
+    "properties_initiatedBy_user_userPrincipalName",
+    "properties_initiatedBy_app_displayName"
    ],
    "note": "where two collectors feed this table, count rows with tenantId set (the other copy is a duplicate)",
    "attribution": "target"
@@ -349,6 +367,12 @@
    "accounts": [
     "UserId",
     "MailboxOwnerUPN"
+   ],
+   "actor": [
+    "UserId"
+   ],
+   "target": [
+    "MailboxOwnerUPN"
    ]
   },
   {
@@ -475,6 +499,12 @@
    "accounts": [
     "Recipients",
     "P2Sender"
+   ],
+   "actor": [
+    "P2Sender"
+   ],
+   "target": [
+    "Recipients"
    ]
   },
   {
@@ -563,6 +593,13 @@
     "actor",
     "user",
     "external_identity_username"
+   ],
+   "actor": [
+    "actor",
+    "external_identity_username"
+   ],
+   "target": [
+    "user"
    ],
    "by": "user"
   },
