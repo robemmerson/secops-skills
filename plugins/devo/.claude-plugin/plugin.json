@@ -1,6 +1,6 @@
 {
   "name": "devo",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Query Devo SIEM data with LINQ, investigate entities and triage Devo alerts (read-only, plus approved alert comments).",
   "author": {
     "name": "Rob Emmerson",
