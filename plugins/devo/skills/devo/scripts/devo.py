@@ -69,6 +69,14 @@ HINTS = os.path.join(SKILL_DIR, "references", "hints")  # generic seeds; the cac
 WINDOWS = os.name == "nt"
 
 
+def inside_skill(path):
+    """Whether path is in the skill directory (never on another Windows drive)."""
+    try:
+        return os.path.commonpath([os.path.abspath(path), SKILL_DIR]) == SKILL_DIR
+    except ValueError:
+        return False
+
+
 class DevoError(Exception):
     def __init__(self, msg, hint="", code=2):
         super().__init__(msg)
@@ -1757,7 +1765,7 @@ def cmd_board(cfg, a):
 
 def write_private_file(path, text):
     d = os.path.dirname(os.path.abspath(path))
-    if os.path.commonpath([d, SKILL_DIR]) == SKILL_DIR:
+    if inside_skill(d):
         raise DevoError("don't write board exports inside the skill directory", code=1)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -2484,7 +2492,7 @@ def cmd_activity(cfg, a):
     if None in (frm_s, to_s) or frm_s >= to_s:
         raise DevoError("activity needs concrete --from/--to (e.g. today, 24h, ISO) with from < to", code=1)
     out_dir = os.path.abspath(os.path.expanduser(a.out_dir))
-    if os.path.commonpath([out_dir, SKILL_DIR]) == SKILL_DIR:
+    if inside_skill(out_dir):
         raise DevoError("--out-dir must not be inside the skill directory (results hold personal data)", code=1)
     os.makedirs(out_dir, exist_ok=True)
     conf = load_activity_sources(a.sources) if a.sources else domain_sources(cfg)
@@ -3374,7 +3382,7 @@ def cmd_batch(cfg, a):
             print(f"# warning: job {j['name']}: unreplaced placeholder(s) {', '.join(left)} (pass --vars)",
                   file=sys.stderr)
     out_dir = os.path.abspath(os.path.expanduser(a.out_dir))
-    if os.path.commonpath([out_dir, SKILL_DIR]) == SKILL_DIR:
+    if inside_skill(out_dir):
         raise DevoError("--out-dir must not be inside the skill directory (results hold personal data)", code=1)
     os.makedirs(out_dir, exist_ok=True)
     tz = get_tz(a.tz)
@@ -3972,7 +3980,7 @@ def cmd_teams(cfg, a):
         raise DevoError("teams: --from is in the future", code=1)
     ing_to = min(now, to_s + TEAMS_SLACK)
     out_path = os.path.abspath(os.path.expanduser(a.out))
-    if os.path.commonpath([out_path, SKILL_DIR]) == SKILL_DIR:
+    if inside_skill(out_path):
         raise DevoError("--out must not be inside the skill directory (results hold personal data)", code=1)
     queries, notes = [], []
     start = time.time()
@@ -5807,11 +5815,7 @@ class Cache:
         env = os.environ if env is None else env
         self.root = os.path.abspath(root or cache_root(env))
         self.dir = os.path.join(self.root, cache_key(cfg, env))
-        try:
-            inside = os.path.commonpath([os.path.abspath(self.dir), SKILL_DIR]) == SKILL_DIR
-        except ValueError:  # Windows: on different drives
-            inside = False
-        if inside:
+        if inside_skill(self.dir):
             raise DevoError("the cache must not live inside the skill directory", code=1)
         cap = env.get("DEVO_CACHE_MAX_AGE_DAYS")
         try:

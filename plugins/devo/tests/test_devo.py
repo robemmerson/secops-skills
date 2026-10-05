@@ -9,6 +9,12 @@ import devo  # noqa: E402
 os.environ["DEVO_CACHE_DIR"] = tempfile.mkdtemp(prefix="devo-cache-test-")
 os.environ.pop("DEVO_CACHE_KEY", None)
 
+try:
+    devo.get_tz("Europe/London")
+    HAS_IANA_ZONES = True
+except devo.DevoError:  # Windows has no system zone database; zoneinfo then needs the tzdata package
+    HAS_IANA_ZONES = False
+
 NOW = 1790611381  # 2026-09-28 16:03:01 UTC
 
 
@@ -155,7 +161,7 @@ class ConfigTests(unittest.TestCase):
         usual = os.path.join(home, ".config", "devo", "env")
         with mock.patch.object(devo.os.path, "expanduser", lambda p: p.replace("~", home, 1)):
             self.assertEqual(devo.env_file_path({}), usual)  # nothing exists: the usual place
-            self.assertEqual(devo.env_file_path({"DEVO_ENV_FILE": "~/x"}), os.path.join(home, "x"))
+            self.assertEqual(devo.env_file_path({"DEVO_ENV_FILE": "~/x"}), home + "/x")
             xdg = os.path.join(home, "xdg")
             self.assertEqual(devo.env_file_path({"XDG_CONFIG_HOME": xdg}), os.path.join(xdg, "devo", "env"))
             appdata = os.path.join(home, "AppData", "Roaming")
@@ -976,6 +982,7 @@ class AutoSplitTests(unittest.TestCase):
 
 
 class OutputControlTests(unittest.TestCase):
+    @unittest.skipUnless(HAS_IANA_ZONES, "no time-zone database (Windows without tzdata)")
     def test_stats_head_out_and_tz(self):
         code, out, err, _ = run_cli(["query", "from t select *", "--stats"], [FakeResp(COMPACT)])
         self.assertEqual(code, 0)
@@ -1009,6 +1016,7 @@ class OutputControlTests(unittest.TestCase):
 
 
 class LocalTimeTests(unittest.TestCase):
+    @unittest.skipUnless(HAS_IANA_ZONES, "no time-zone database (Windows without tzdata)")
     def test_parse_and_local(self):
         tz = devo.get_tz("Europe/London")
         self.assertEqual(devo.to_local("2026-10-02T13:04:32.123Z", tz), "2026-10-02T14:04:32+01:00")
@@ -1286,6 +1294,7 @@ class TimelineTests(unittest.TestCase):
         self.assertGreater(len(every), len(kept))
         self.assertIn("before the window", err.getvalue())
 
+    @unittest.skipUnless(HAS_IANA_ZONES, "no time-zone database (Windows without tzdata)")
     def test_timeline_offline(self):
         with mock.patch.object(devo, "load_config", side_effect=devo.DevoError("no Devo token found", code=1)):
             out, err = io.StringIO(), io.StringIO()
@@ -1364,6 +1373,7 @@ class TeamsTests(unittest.TestCase):
             msg(10, "MessageSent", "me@x.com", me, self.ONE, "2026-09-20T08:00:00"),  # outside the window
         ]
 
+    @unittest.skipUnless(HAS_IANA_ZONES, "no time-zone database (Windows without tzdata)")
     def test_build_model(self):
         recs = self.recs()
         recs[6]["Id"] = self.MD1
@@ -1400,6 +1410,7 @@ class TeamsTests(unittest.TestCase):
         self.assertEqual(days["2026-10-01"]["meeting_joins"], 1)
         self.assertEqual([s["kind"] for s in m["shares"]], ["file", "link"])
 
+    @unittest.skipUnless(HAS_IANA_ZONES, "no time-zone database (Windows without tzdata)")
     def test_cli(self):
         recs = self.recs()
         recs[6]["Id"] = self.MD1
@@ -1467,7 +1478,7 @@ class BoardTests(unittest.TestCase):
 
     def write(self, name, obj):
         p = os.path.join(self.tmp, name)
-        with open(p, "w") as f:
+        with open(p, "w", encoding="utf-8") as f:
             json.dump(obj, f)
         return p
 
@@ -1510,7 +1521,7 @@ class BoardTests(unittest.TestCase):
         out = os.path.join(self.tmp, "b.json")
         code, _, err, reqs = run_cli(["board-new", spec, "--out", out], [])
         self.assertEqual((code, reqs), (0, []))
-        with open(out) as f:
+        with open(out, encoding="utf-8") as f:
             doc = json.load(f)
         s = doc["settings"]
         self.assertEqual(s["children"]["Table0"]["datasource"], "from a select b")
@@ -1521,7 +1532,8 @@ class BoardTests(unittest.TestCase):
         self.assertEqual((lay["Line0"]["x"], lay["Line0"]["y"]), (0, 10))  # 6 + 8 > 12: next row
         self.assertEqual((lay["Select0"]["x"], lay["Select0"]["y"]), (8, 10))
         self.assertEqual(devo.board_lint(s)[0], [])
-        self.assertEqual(os.stat(out).st_mode & 0o077, 0)
+        if os.name != "nt":  # POSIX modes; Windows relies on the profile's ACLs
+            self.assertEqual(os.stat(out).st_mode & 0o077, 0)
 
     def test_list_uses_activeboards_api_and_hides_token(self):
         code, out, err, reqs = run_cli(["boards", "--grep", "soc"], [FakeResp(json.dumps([BOARD]))])
@@ -1538,7 +1550,7 @@ class BoardTests(unittest.TestCase):
         code, text, _, _ = run_cli(["board", "34567", "--out", out], [FakeResp(json.dumps(BOARD))])
         self.assertEqual(code, 0)
         self.assertIn('eq(method, "POST")', text)
-        with open(out) as f:
+        with open(out, encoding="utf-8") as f:
             doc = json.load(f)
         self.assertEqual(doc["exported_from"], {"id": 34567, "updateDate": 1790611330000})
         self.assertNotIn("owner", doc)
@@ -1583,8 +1595,9 @@ class BoardTests(unittest.TestCase):
         self.assertEqual([r.get_method() for r in reqs], ["GET", "PUT", "GET"])
         backup = re.search(r"backup of the current board: (\S+)", err).group(1)
         self.assertTrue(backup.startswith(os.environ["DEVO_CACHE_DIR"]))
-        self.assertEqual(os.stat(backup).st_mode & 0o077, 0)
-        with open(backup) as fh:
+        if os.name != "nt":  # POSIX modes; Windows relies on the profile's ACLs
+            self.assertEqual(os.stat(backup).st_mode & 0o077, 0)
+        with open(backup, encoding="utf-8") as fh:
             self.assertEqual(json.load(fh)["settings"], BOARD["settings"])
 
     def test_set_patches(self):
