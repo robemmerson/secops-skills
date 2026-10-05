@@ -48,22 +48,23 @@ class EvalSuiteTest(unittest.TestCase):
             self.assertIn(eco, names)
 
     @unittest.skipIf(yaml is None, "PyYAML not installed")
+    @unittest.skipIf(os.name == "nt", "the scaffolds run in the Linux eval sandbox")
     def test_cases_parse_and_scaffolds_build_the_fixture(self):
         for case_dir in cases():
             with self.subTest(case=case_dir.name):
-                case = yaml.safe_load((case_dir / "case.yaml").read_text())
+                case = yaml.safe_load((case_dir / "case.yaml").read_text(encoding="utf-8"))
                 self.assertEqual(case["schema_version"], "1.1")
                 self.assertTrue(case["graders"])
                 with tempfile.TemporaryDirectory() as ws:
                     subprocess.run(["bash", str(case_dir / case["context"]["scaffold_script"])], cwd=ws,
                                    check=True, capture_output=True, timeout=60)
-                    snap = (Path(ws) / "REGISTRY_SNAPSHOT.md").read_text()
+                    snap = (Path(ws) / "REGISTRY_SNAPSHOT.md").read_text(encoding="utf-8")
                     self.assertRegex(snap, r"\| 1\.4\.0 \| 20\d\d-\d\d-\d\dT")  # times filled in at run time
                     for g in case["graders"]:
                         if g["type"] == "regex":
                             path = Path(ws) / g["target"]["path"]
                             self.assertTrue(path.exists(), g["name"])
-                            hit = bool(re.search(g["pattern"], path.read_text()))
+                            hit = bool(re.search(g["pattern"], path.read_text(encoding="utf-8")))
                             # before any update: only the "new version" check fails
                             want = g["name"] != "manifest-updated"
                             self.assertEqual(hit if g.get("match") != "not_contains" else not hit, want, g["name"])

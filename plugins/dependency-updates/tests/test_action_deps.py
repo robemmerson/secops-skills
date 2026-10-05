@@ -44,7 +44,7 @@ class ActionDepsTest(unittest.TestCase):
 
     def workflow(self, text):
         d = tempfile.mkdtemp()
-        with open(os.path.join(d, "ci.yml"), "w") as f:
+        with open(os.path.join(d, "ci.yml"), "w", encoding="utf-8") as f:
             f.write(text)
         return d
 
@@ -205,7 +205,7 @@ class Base(unittest.TestCase):
     def workflow(self, text, name="ci.yml"):
         d = tempfile.mkdtemp()
         self.addCleanup(__import__("shutil").rmtree, d)
-        with open(os.path.join(d, name), "w") as f:
+        with open(os.path.join(d, name), "w", encoding="utf-8") as f:
             f.write(text)
         return d
 
@@ -478,9 +478,9 @@ jobs:
 
     def test_files_and_line_numbers_across_a_directory(self):
         d = self.workflow("jobs:\n  a:\n    steps:\n      - uses: o/r@v1\n", name="a.yml")
-        with open(os.path.join(d, "b.yaml"), "w") as f:
+        with open(os.path.join(d, "b.yaml"), "w", encoding="utf-8") as f:
             f.write("jobs:\n  b:\n    steps:\n      - run: x\n      - uses: o/r@v2\n")
-        with open(os.path.join(d, "broken.yml"), "w") as f:
+        with open(os.path.join(d, "broken.yml"), "w", encoding="utf-8") as f:
             f.write("jobs: [\n  - uses: o/s@v1\n")  # invalid YAML: the line scan still finds it
         u = self.m.find_usages([d])
         self.assertEqual(u["o/r"]["locs"], {os.path.join(d, "a.yml"): [4], os.path.join(d, "b.yaml"): [5]})
