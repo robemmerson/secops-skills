@@ -101,12 +101,15 @@ treatment: every third-party `uses:` (steps and job-level reusable workflows) is
 pinned to a full 40-character commit SHA with the version in a comment.
 
 ```bash
-S=<this skill's base directory>/scripts   # shown as "Base directory for this skill" when it loads
+S='<base directory>/scripts'   # the skill's "Base directory for this skill", shown when it loads
 
-python3 $S/action-deps.py check [--min-age-hours 72] [paths]  # the whole audit (default .github/workflows)
-python3 $S/action-deps.py resolve OWNER/REPO vX.Y.Z           # one tag -> commit SHA + age
-python3 $S/action-deps.py inputs  OWNER/REPO[/PATH] REF       # what that version accepts
+python3 "$S/action-deps.py" check [--min-age-hours 72] [paths]  # the whole audit (default .github/workflows)
+python3 "$S/action-deps.py" resolve OWNER/REPO vX.Y.Z           # one tag -> commit SHA + age
+python3 "$S/action-deps.py" inputs  OWNER/REPO[/PATH] REF       # what that version accepts
 ```
+
+Keep the quotes: on Windows the base directory contains backslashes, which the shell drops when
+unquoted. There, use `python` (or `py -3`) if `python3` isn't found.
 
 `check` needs an authenticated `gh` and PyYAML. Per action it prints where it is
 used, the current pin, whether each `<sha> # vX.Y.Z` comment really matches that
@@ -135,7 +138,7 @@ Then:
    `uses: actions/checkout@<40-hex> # v5.0.0`. Dependabot and Renovate both keep
    this form updated.
 4. **Prove it parses**:
-   `python3 -c "import yaml,glob;[yaml.safe_load(open(f)) for f in glob.glob('.github/workflows/*.y*ml')]"`.
+   `python3 -c "import yaml,glob;[yaml.safe_load(open(f,encoding='utf-8')) for f in glob.glob('.github/workflows/*.y*ml')]"`.
    That is the honest limit of local verification. The real proof is the workflow
    run on the PR, and steps gated to the default branch stay unproven until merge.
    Say so rather than implying you tested it.
@@ -148,7 +151,7 @@ separately; see `references/github-actions.md`.
 ## 3. Container images
 
 ```bash
-python3 $S/scan-images.py [--all-yaml] [--exclude 'test*/*'] [paths]
+python3 "$S/scan-images.py" [--all-yaml] [--exclude 'test*/*'] [paths]
 ```
 
 This buckets every image reference (Dockerfile `FROM`, compose, and with

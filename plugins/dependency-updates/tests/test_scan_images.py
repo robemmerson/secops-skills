@@ -35,7 +35,7 @@ class ScanTest(unittest.TestCase):
     def write(self, name, text):
         p = self.d / name
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text)
+        p.write_text(text, encoding="utf-8")
         return p
 
     def test_dockerfile_skips_scratch_and_stage_names(self):
@@ -99,7 +99,7 @@ class FilesTest(unittest.TestCase):
     def write(self, name, text):
         p = self.d / name
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text)
+        p.write_text(text, encoding="utf-8")
         return p
 
     def refs(self, f, all_yaml=False):

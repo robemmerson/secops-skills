@@ -31,13 +31,14 @@ Commands:
                                  the domain data cached on this machine (see below)
 
 Credentials: DEVO_TOKEN (and optional DEVO_REGION, default "eu") from the environment,
-otherwise from the env file named by DEVO_ENV_FILE, otherwise ~/.config/devo/env
-(KEY=VALUE lines). The token is never printed.
+otherwise from the env file named by DEVO_ENV_FILE, otherwise ~/.config/devo/env (the same path on
+Windows, macOS and Linux; $XDG_CONFIG_HOME/devo/env and, on Windows, %APPDATA%\\devo\\env are also read).
+KEY=VALUE lines in any common encoding. The token is never printed.
 
 Cache: the domain's table list, schemas, field profiles, verified event-time expressions and validated
 sweep sources are fetched on first use and cached under $DEVO_CACHE_DIR, else
-$XDG_CACHE_HOME/devo-skill, else ~/.cache/devo-skill (one directory per domain; DEVO_CACHE_KEY
-names it, otherwise region + a hash of the token). Entries expire (tables and sources 7 days,
+$XDG_CACHE_HOME/devo-skill, else %LOCALAPPDATA%\\devo-skill on Windows, else ~/.cache/devo-skill
+(one directory per domain; DEVO_CACHE_KEY names it, otherwise region + a hash of the token). Entries expire (tables and sources 7 days,
 schemas, profiles and event time 30; DEVO_CACHE_MAX_AGE_DAYS caps them), are marked stale when a
 query contradicts them, and `cache verify|refresh|clear` refetch or drop them.
 
@@ -48,7 +49,7 @@ expressions containing now() (e.g. "now() - 3h", "(now() - 1d) @ 1d"), passed th
 
 Exit codes: 0 ok, 1 usage/config error, 2 API error, 3 timeout.
 """
-import argparse, csv, datetime as dt, http.client, io, json, os, re, socket, stat, sys, threading, time
+import argparse, codecs, csv, datetime as dt, http.client, io, json, os, re, socket, stat, sys, threading, time
 import urllib.error, urllib.parse, urllib.request
 
 VERSION = "1.0"
@@ -65,6 +66,15 @@ ALERT_STATUS = {0: "Unread", 1: "Updated", 2: "False positive", 100: "Watched", 
 CLOSED_STATUSES = {2, 300}
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HINTS = os.path.join(SKILL_DIR, "references", "hints")  # generic seeds; the cache holds the validated copies
+WINDOWS = os.name == "nt"
+
+
+def inside_skill(path):
+    """Whether path is in the skill directory (never on another Windows drive)."""
+    try:
+        return os.path.commonpath([os.path.abspath(path), SKILL_DIR]) == SKILL_DIR
+    except ValueError:
+        return False
 
 
 class DevoError(Exception):
@@ -76,26 +86,64 @@ class DevoError(Exception):
 # ---------------------------------------------------------------- config
 
 def read_env_file(path):
-    out = {}
+    """KEY=VALUE lines, as written by any editor or shell on Windows, macOS or Linux: a UTF-8 or
+    UTF-16 byte-order mark (Notepad; Windows PowerShell's `>` and Out-File write UTF-16), CRLF line
+    ends, `export `, `set ` or `$env:` prefixes, quotes, and trailing ` # comments` are all fine."""
     try:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("export "):
-                    line = line[7:]
-                if "=" in line and not line.startswith("#"):
-                    k, v = line.split("=", 1)
-                    out[k.strip()] = v.strip().strip('"').strip("'")
+        with open(path, "rb") as f:
+            raw = f.read()
     except OSError:
-        pass
+        return {}
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        text = raw.decode("utf-16", errors="replace")
+    elif raw[1:2] == b"\0":  # UTF-16 LE without a BOM
+        text = raw.decode("utf-16-le", errors="replace")
+    else:
+        text = raw.decode("utf-8-sig", errors="replace")
+    out = {}
+    for line in text.splitlines():
+        line = re.sub(r"^(export\s+|set\s+|\$env:)", "", line.strip(), flags=re.I)
+        if "=" not in line or line.startswith("#"):
+            continue
+        k, v = line.split("=", 1)
+        v = v.strip()
+        if v[:1] in ("'", '"') and v.find(v[0], 1) > 0:
+            v = v[1:v.index(v[0], 1)]
+        else:
+            v = re.sub(r"\s+#.*$", "", v)
+        out[k.strip()] = v
     return out
+
+
+def env_file_paths(env):
+    """Where the env file is looked for, in order. ~/.config/devo/env works on every OS (on Windows
+    ~ is %USERPROFILE%); $XDG_CONFIG_HOME/devo/env comes first when set, and %APPDATA%\\devo\\env
+    is also read on Windows."""
+    paths = []
+    if env.get("XDG_CONFIG_HOME"):
+        paths.append(os.path.join(env["XDG_CONFIG_HOME"], "devo", "env"))
+    paths.append(os.path.join(os.path.expanduser("~"), ".config", "devo", "env"))
+    if WINDOWS and env.get("APPDATA"):
+        paths.append(os.path.join(env["APPDATA"], "devo", "env"))
+    return paths
+
+
+def env_file_path(env):
+    """DEVO_ENV_FILE, else the first of env_file_paths() that exists, else the usual place."""
+    if env.get("DEVO_ENV_FILE"):
+        return os.path.expanduser(env["DEVO_ENV_FILE"])
+    paths = env_file_paths(env)
+    return next((p for p in paths if os.path.isfile(p)), paths[0])
 
 
 _WARNED = set()
 
 
 def warn_if_exposed(path):
-    """The token file should be private to the user: say so once if not."""
+    """The token file should be private to the user: say so once if not. POSIX only: Windows
+    file modes don't reflect ACLs, and files under the user profile are private by default."""
+    if WINDOWS:
+        return
     for p, want in ((path, 0o600),):
         try:
             mode = stat.S_IMODE(os.stat(p).st_mode)
@@ -109,7 +157,7 @@ def warn_if_exposed(path):
 
 def load_config(environ=None):
     env = os.environ if environ is None else environ
-    path = env.get("DEVO_ENV_FILE") or os.path.expanduser("~/.config/devo/env")
+    path = env_file_path(env)
     filevals = read_env_file(path)
     if filevals.get("DEVO_TOKEN") and not env.get("DEVO_TOKEN"):
         warn_if_exposed(path)
@@ -191,6 +239,8 @@ def get_tz(name):
     """An IANA zone (e.g. Europe/London) for the *_local columns, or None."""
     if not name:
         return None
+    if name.upper() in ("UTC", "Z"):
+        return dt.timezone.utc
     try:
         from zoneinfo import ZoneInfo
     except ImportError:
@@ -198,7 +248,10 @@ def get_tz(name):
     try:
         return ZoneInfo(name)
     except Exception:
-        raise DevoError(f"--tz {name!r}: unknown time zone", "use an IANA name such as Europe/London or UTC", code=1)
+        hint = "use an IANA name such as Europe/London or UTC"
+        if WINDOWS:  # Windows has no system zone database: zoneinfo reads the tzdata package
+            hint += "; on Windows, IANA zones also need the tzdata package (pip install tzdata)"
+        raise DevoError(f"--tz {name!r}: unknown time zone", hint, code=1)
 
 
 def parse_utc(v):
@@ -962,7 +1015,7 @@ def cmd_query(cfg, a):
         rows = sort_rows(rows, [c[0] for c in columns], a.sort)
     names = [c[0] for c in columns]
     if a.out:
-        with open(a.out, "w", newline="") as out:
+        with open(a.out, "w", newline="", encoding="utf-8") as out:
             write_rows(out, a.format, columns, rows, 0 if a.format != "table" else a.width)
     if a.stats or (a.out and not a.no_summary):
         sys.stdout.write(stats_text(names, rows))
@@ -1712,7 +1765,7 @@ def cmd_board(cfg, a):
 
 def write_private_file(path, text):
     d = os.path.dirname(os.path.abspath(path))
-    if os.path.commonpath([d, SKILL_DIR]) == SKILL_DIR:
+    if inside_skill(d):
         raise DevoError("don't write board exports inside the skill directory", code=1)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -2213,7 +2266,7 @@ GUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}
 
 
 def load_activity_sources(path=None):
-    with open(path or HINT_SOURCES) as f:
+    with open(path or HINT_SOURCES, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -2347,7 +2400,7 @@ def run_source(cfg, src, terms, frm_s, to_s, limit, timeout, out_dir, rows=False
     if grouped and (info["windows"] > 1 or info["splits"]):
         recs = merge_agg(recs, [f.strip() for f in src["group"].split(",")])
     path = os.path.join(out_dir, f"{src['name']}.jsonl")
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         for r in recs:
             f.write(json.dumps(add_local_fields(r, tz), ensure_ascii=False) + "\n")
     # some tables store identities with quote marks ("x@y"); show them bare. Without `accounts`,
@@ -2439,7 +2492,7 @@ def cmd_activity(cfg, a):
     if None in (frm_s, to_s) or frm_s >= to_s:
         raise DevoError("activity needs concrete --from/--to (e.g. today, 24h, ISO) with from < to", code=1)
     out_dir = os.path.abspath(os.path.expanduser(a.out_dir))
-    if os.path.commonpath([out_dir, SKILL_DIR]) == SKILL_DIR:
+    if inside_skill(out_dir):
         raise DevoError("--out-dir must not be inside the skill directory (results hold personal data)", code=1)
     os.makedirs(out_dir, exist_ok=True)
     conf = load_activity_sources(a.sources) if a.sources else domain_sources(cfg)
@@ -2455,7 +2508,7 @@ def cmd_activity(cfg, a):
         sources = []
     prior = os.path.join(out_dir, "summary.json")
     if a.graph_only and os.path.exists(prior):  # run the Graph pass over the earlier sweep's window
-        with open(prior) as f:
+        with open(prior, encoding="utf-8") as f:
             w = [parse_utc(x) for x in json.load(f).get("window") or []]
         if len(w) == 2 and all(w):
             frm_s, to_s = int(w[0].timestamp()), int(w[1].timestamp())
@@ -2520,7 +2573,7 @@ def cmd_activity(cfg, a):
         print("# feed gaps inside the window (newest data in the collector counter): " + ", ".join(
             f"{t} after {v[:16]}" for t, v in sorted(feed_gaps.items())), file=sys.stderr)
     if a.graph_only and os.path.exists(prior):  # add the Graph pass to the earlier sweep in the same directory
-        with open(prior) as f:
+        with open(prior, encoding="utf-8") as f:
             old = json.load(f)
         names = {r["source"] for r in results}
         results = [r for r in old.get("sources", []) if r["source"] not in names] + results
@@ -2531,7 +2584,7 @@ def cmd_activity(cfg, a):
     summary = {"term": terms[0] if len(terms) == 1 else ",".join(terms), "terms": terms, "by": a.by,
                "rows_mode": bool(a.rows), "tz": a.tz, "window": [fmt_epoch(frm_s), fmt_epoch(to_s)],
                "seconds": round(time.time() - start), "sources": results, "feed_gaps": feed_gaps}
-    with open(os.path.join(out_dir, "summary.json"), "w") as f:
+    with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=1, ensure_ascii=False)
     print_activity(summary, a.width)
     return 0
@@ -2611,7 +2664,7 @@ def print_activity(summary, width):
 
 def _read_jsonl(path):
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return [json.loads(line) for line in f if line.strip()]
     except OSError:
         return []
@@ -2780,7 +2833,7 @@ def cmd_profile(cfg, a):
     from concurrent.futures import ThreadPoolExecutor
     tables = a.tables
     if a.from_file:
-        with open(a.from_file) as f:
+        with open(a.from_file, encoding="utf-8-sig") as f:
             tables = [l.split()[-1] for l in f if l.strip() and not l.startswith("#")]
 
     def one(t):
@@ -2793,7 +2846,7 @@ def cmd_profile(cfg, a):
         results = list(pool.map(one, tables))
     if a.write:
         if os.path.exists(a.write):
-            with open(a.write) as f:
+            with open(a.write, encoding="utf-8") as f:
                 fm = json.load(f)  # raw: curated roles stay in field-roles.json
         else:
             fm = {"tables": {}}
@@ -2806,7 +2859,7 @@ def cmd_profile(cfg, a):
                 if t not in fm["unqueryable"]:
                     fm["unqueryable"].append(t)
         fm["tables"] = dict(sorted(fm["tables"].items()))
-        with open(a.write, "w") as f:
+        with open(a.write, "w", encoding="utf-8") as f:
             json.dump(fm, f, indent=0, ensure_ascii=False, sort_keys=False)
             f.write("\n")
     if a.format == "json":
@@ -2857,7 +2910,7 @@ def apply_roles(fm, roles_path):
     """Apply curated role corrections on top of profiled roles, so re-profiling never loses them. A
     curated role of null clears a wrong guess."""
     if roles_path and os.path.exists(roles_path):
-        with open(roles_path) as f:
+        with open(roles_path, encoding="utf-8") as f:
             curated = json.load(f)
         everywhere = curated.get("*") or {}  # by field name, for every table; table keys override
 
@@ -2883,7 +2936,7 @@ def load_field_map(path=None, roles_path=None):
     domain, with the curated roles in references/hints/field-roles.json applied on top."""
     if path is None:
         return cached_field_map()
-    with open(path) as f:
+    with open(path, encoding="utf-8-sig") as f:
         fm = json.load(f)
     return apply_roles(fm, roles_path)
 
@@ -2947,7 +3000,7 @@ def load_event_time(path=None):
             return d
     path = path or EVENT_TIME
     if path not in _EVENT_TIME_CACHE:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             _EVENT_TIME_CACHE[path] = json.load(f)["families"]
     return _EVENT_TIME_CACHE[path]
 
@@ -3121,7 +3174,7 @@ def cmd_lag(cfg, a):
     tz = get_tz(a.tz)
     now = int(time.time())
     if a.out:
-        with open(a.out, "w") as f:
+        with open(a.out, "w", encoding="utf-8") as f:
             json.dump({"window": [fmt_epoch(frm_s), fmt_epoch(to_s)], "measured": fmt_epoch(now),
                        "tables": results}, f, indent=1, ensure_ascii=False)
     rows = []
@@ -3177,7 +3230,7 @@ def load_spec(path):
     if path == "-":
         text = sys.stdin.read()
     else:
-        with open(path) as f:
+        with open(path, encoding="utf-8-sig") as f:
             text = f.read()
     try:
         obj = json.loads(text)
@@ -3194,7 +3247,7 @@ def load_spec(path):
         if "query_file" in j and "query" not in j:
             qp = os.path.join(base, os.path.expanduser(j["query_file"]))
             try:
-                with open(qp) as f:
+                with open(qp, encoding="utf-8-sig") as f:
                     j["query"] = f.read()
             except OSError as e:
                 raise DevoError(f"job {j.get('name')}: query_file {qp}: {e.strerror}", code=1)
@@ -3278,7 +3331,7 @@ def run_job(cfg, job, out_dir, tz, defaults):
         rows = [[convert_value(v, t) for v, t in zip(r, types)] for r in rows]
         if tz:
             columns, rows = add_local_columns(columns, rows, tz)
-        with open(path, "w", newline="") as f:
+        with open(path, "w", newline="", encoding="utf-8") as f:
             write_rows(f, fmt, columns, rows, 0)
         res.update(rows=len(rows), limit_reached=bool(info["full"]), splits=info["splits"],
                    range=[fmt_epoch(frm_s), fmt_epoch(to_s)])
@@ -3297,7 +3350,7 @@ def run_job(cfg, job, out_dir, tz, defaults):
         log.append(f"ERROR: {res['error']}")
     res["seconds"] = round(time.time() - start, 1)
     log.append(f"# {res['seconds']}s")
-    with open(os.path.join(out_dir, f"{name}.log"), "w") as f:
+    with open(os.path.join(out_dir, f"{name}.log"), "w", encoding="utf-8") as f:
         f.write("\n".join(log) + "\n")
     return res
 
@@ -3329,7 +3382,7 @@ def cmd_batch(cfg, a):
             print(f"# warning: job {j['name']}: unreplaced placeholder(s) {', '.join(left)} (pass --vars)",
                   file=sys.stderr)
     out_dir = os.path.abspath(os.path.expanduser(a.out_dir))
-    if os.path.commonpath([out_dir, SKILL_DIR]) == SKILL_DIR:
+    if inside_skill(out_dir):
         raise DevoError("--out-dir must not be inside the skill directory (results hold personal data)", code=1)
     os.makedirs(out_dir, exist_ok=True)
     tz = get_tz(a.tz)
@@ -3351,7 +3404,7 @@ def cmd_batch(cfg, a):
         for tname, lt in gaps.items():
             for r in tbl[tname]:
                 r["feed_gap"] = lt
-    with open(os.path.join(out_dir, "batch-summary.json"), "w") as f:
+    with open(os.path.join(out_dir, "batch-summary.json"), "w", encoding="utf-8") as f:
         json.dump({"spec": os.path.abspath(a.spec) if a.spec != "-" else "-", "vars": variables, "feed_gaps": gaps,
                    "seconds": round(time.time() - start), "jobs": results}, f, indent=1, ensure_ascii=False)
     rows = [[r["name"], r["rows"], "yes" if r["limit_reached"] else "no",
@@ -3494,7 +3547,7 @@ def dedupe_key(rec, fam, table):
 
 def build_timeline(act_dir, tz=None, fm=None, families=None):
     """Merge an `activity` --out-dir into one sorted event list. Returns (events, notes, summary)."""
-    with open(os.path.join(act_dir, "summary.json")) as f:
+    with open(os.path.join(act_dir, "summary.json"), encoding="utf-8") as f:
         summary = json.load(f)
     try:
         fm = fm if fm is not None else load_field_map()
@@ -3628,11 +3681,11 @@ def cmd_timeline(cfg, a):
                          "); --keep-outside keeps them")
     text = day_summary(events, tz)
     out = a.out or os.path.join(act_dir, "timeline.json")
-    with open(out, "w") as f:
+    with open(out, "w", encoding="utf-8") as f:
         json.dump({"terms": summary.get("terms") or [summary.get("term")], "window": summary.get("window"),
                    "tz": a.tz or "UTC", "events": events, "notes": notes}, f, indent=1, ensure_ascii=False)
     txt = re.sub(r"\.json$", "", out) + ".txt"
-    with open(txt, "w") as f:
+    with open(txt, "w", encoding="utf-8") as f:
         f.write(text)
     sys.stdout.write(text)
     for n in notes:
@@ -3927,7 +3980,7 @@ def cmd_teams(cfg, a):
         raise DevoError("teams: --from is in the future", code=1)
     ing_to = min(now, to_s + TEAMS_SLACK)
     out_path = os.path.abspath(os.path.expanduser(a.out))
-    if os.path.commonpath([out_path, SKILL_DIR]) == SKILL_DIR:
+    if inside_skill(out_path):
         raise DevoError("--out must not be inside the skill directory (results hold personal data)", code=1)
     queries, notes = [], []
     start = time.time()
@@ -4052,7 +4105,7 @@ def cmd_teams(cfg, a):
                       "only on MessageCreatedHasLink/MessageEditedHasLink rows",
                       "channel conversations count only the subject's own posts" if oids else
                       "per-actor counts are under each conversation's subject/others (no subject in thread mode)"]})
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(model, f, indent=1, ensure_ascii=False, default=sorted)
     by_type = {}
     for c in model["conversations"]:
@@ -4517,7 +4570,7 @@ def cmd_health(cfg, a):
         except DevoError as e:
             report["errors"]["lag"] = str(e)
     if a.out:
-        with open(a.out, "w") as f:
+        with open(a.out, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=1, ensure_ascii=False, default=list)
     print_health(report, a)
     sys.stdout.flush()
@@ -4899,7 +4952,7 @@ def cmd_logons(cfg, a):
     shown = [e for e in report["logons"] if e["kind"] in keep]
     before = [e for e in shown if e.get("first") and e["first"] < report["window"][0][:19]]
     if a.csv:
-        with open(a.csv, "w", newline="") as f:
+        with open(a.csv, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["os", "host", "account", "kind", "logons", "how", "first_utc", "last_utc", "time_basis",
                         "top_sources", "variants", "via_ztna", "why"])
@@ -4990,7 +5043,7 @@ def cmd_logons(cfg, a):
                      e["kind"], e["logons"], ", ".join(f"{k} {v}" for k, v in e["how"].items()), fmt_t(e["first"]),
                      fmt_t(e["last"]), ", ".join(e["sources"])] for e in lst[:share]], a.width)
     if a.out:
-        with open(a.out, "w") as f:
+        with open(a.out, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=1, ensure_ascii=False)
     sys.stdout.flush()
     print(f"# {len(shown)} pairs listed ({', '.join(sorted(keep))}); 'logons' counts 4624 events (admin logons write "
@@ -5060,7 +5113,7 @@ def creds_stage2(a):
                 failed.setdefault(r.get("properties_ipAddress"), set()).add((r.get("properties_userPrincipalName") or "").lower())
     win0 = ""
     try:
-        with open(os.path.join(d, "batch-summary.json")) as f:
+        with open(os.path.join(d, "batch-summary.json"), encoding="utf-8") as f:
             win0 = min(j["range"][0] for j in json.load(f)["jobs"] if j.get("range"))
     except (OSError, ValueError, KeyError):
         pass
@@ -5169,7 +5222,7 @@ def creds_stage2(a):
     if others and not stage3_ran:
         q = ", ".join(json.dumps(u) for u in sorted(others)[:200])
         out = os.path.join(s2, "stage3.jsonl")
-        with open(out, "w") as f:
+        with open(out, "w", encoding="utf-8") as f:
             f.write(json.dumps({"name": "other_users_baseline", "from": "30d", "to": "now", "chunk": "1d", "parallel": 6,
                                 "limit": 0, "query": "from cloud.azure.ad.signin where properties_status_errorCode = 0, "
                                 f"properties_userPrincipalName in {{{q}}} group by properties_userPrincipalName, "
@@ -5238,7 +5291,7 @@ def cmd_creds(cfg, a):
                    key=lambda kv: -len(kv[1]["ips"]))
     p = print
     try:
-        with open(os.path.join(d, "batch-summary.json")) as f:
+        with open(os.path.join(d, "batch-summary.json"), encoding="utf-8") as f:
             for tname, lt in (json.load(f).get("feed_gaps") or {}).items():
                 p(f"FEED GAP: {tname} received nothing after {lt[:16]}: 0 rows there is not 'nothing happened'")
     except (OSError, ValueError):
@@ -5430,7 +5483,7 @@ def cmd_creds(cfg, a):
                                           "properties_location_countryOrRegion, properties_appDisplayName "
                                           "select count() as n, min(eventdate) as first, max(eventdate) as last"})
     out = a.stage2 or os.path.join(d, "stage2.jsonl")
-    with open(out, "w") as f:
+    with open(out, "w", encoding="utf-8") as f:
         for j in jobs:
             f.write(json.dumps(j, ensure_ascii=False) + "\n")
     if unchecked:
@@ -5504,7 +5557,7 @@ def cmd_grants(cfg, a):
 
     p = print
     try:
-        with open(os.path.join(d, "batch-summary.json")) as f:
+        with open(os.path.join(d, "batch-summary.json"), encoding="utf-8") as f:
             for tname, lt in (json.load(f).get("feed_gaps") or {}).items():
                 p(f"FEED GAP: {tname} received nothing after {lt[:16]}: changes after that are not visible")
     except (OSError, ValueError):
@@ -5573,7 +5626,7 @@ def cmd_grants(cfg, a):
                 g["removed"] = "NOT removed in the window: may still be active"
     window = ""
     try:
-        with open(os.path.join(d, "batch-summary.json")) as f:
+        with open(os.path.join(d, "batch-summary.json"), encoding="utf-8") as f:
             rng = [j.get("range") for j in json.load(f)["jobs"] if j["name"] == "entra_role_changes"][0]
             window = f"{rng[0]} → {rng[1]} UTC"
     except (OSError, ValueError, KeyError, IndexError, TypeError):
@@ -5734,7 +5787,11 @@ def cache_root(env=None):
     env = os.environ if env is None else env
     if env.get("DEVO_CACHE_DIR"):
         return os.path.abspath(os.path.expanduser(env["DEVO_CACHE_DIR"]))
-    return os.path.join(env.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "devo-skill")
+    if env.get("XDG_CACHE_HOME"):
+        return os.path.join(env["XDG_CACHE_HOME"], "devo-skill")
+    if WINDOWS and env.get("LOCALAPPDATA"):
+        return os.path.join(env["LOCALAPPDATA"], "devo-skill")
+    return os.path.join(os.path.expanduser("~"), ".cache", "devo-skill")
 
 
 def cache_key(cfg, env=None):
@@ -5758,7 +5815,7 @@ class Cache:
         env = os.environ if env is None else env
         self.root = os.path.abspath(root or cache_root(env))
         self.dir = os.path.join(self.root, cache_key(cfg, env))
-        if os.path.commonpath([os.path.abspath(self.dir), SKILL_DIR]) == SKILL_DIR:
+        if inside_skill(self.dir):
             raise DevoError("the cache must not live inside the skill directory", code=1)
         cap = env.get("DEVO_CACHE_MAX_AGE_DAYS")
         try:
@@ -5777,7 +5834,7 @@ class Cache:
 
     def read(self, name):
         try:
-            with open(self.path(name)) as f:
+            with open(self.path(name), encoding="utf-8") as f:
                 e = json.load(f)
         except (OSError, ValueError):
             return None
@@ -5802,7 +5859,7 @@ class Cache:
     def mkdirs(self, d):
         """Create d and every directory from the cache root down to it as 0700, and tighten any that
         already exist (makedirs applies its mode to the last directory only): domain data is for
-        the user's eyes only."""
+        the user's eyes only. On Windows modes don't apply; the user profile's ACLs keep it private."""
         os.makedirs(os.path.dirname(self.root), exist_ok=True)  # e.g. ~/.cache: not ours to change
         rel = os.path.relpath(d, self.root)
         parts = [] if rel == "." else rel.split(os.sep)
@@ -5813,7 +5870,7 @@ class Cache:
                 os.mkdir(cur, 0o700)
             except FileExistsError:
                 pass
-            if stat.S_IMODE(os.stat(cur).st_mode) != 0o700:
+            if not WINDOWS and stat.S_IMODE(os.stat(cur).st_mode) != 0o700:
                 os.chmod(cur, 0o700)
 
     def _write(self, name, e):
@@ -5821,9 +5878,17 @@ class Cache:
         self.mkdirs(os.path.dirname(path))
         tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(e, f, ensure_ascii=False)
-        os.replace(tmp, path)
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:  # Windows: another thread has the old file open for a moment
+                if attempt == 4:
+                    os.remove(tmp)
+                    raise
+                time.sleep(0.05 * (attempt + 1))
 
     def put(self, name, data, **extra):
         self._write(name, dict(extra, version=CACHE_VERSION, fetched=int(time.time()), data=data))
@@ -6942,5 +7007,14 @@ def main(argv=None):
         return 0
 
 
+def utf8_stdio():
+    """Write UTF-8 even where the locale's code page isn't (Windows pipes default to cp1252, which
+    can't encode most non-Latin names in log data)."""
+    for s in (sys.stdout, sys.stderr):
+        if hasattr(s, "reconfigure") and (s.encoding or "").lower().replace("-", "") != "utf8":
+            s.reconfigure(encoding="utf-8", errors="replace")
+
+
 if __name__ == "__main__":
+    utf8_stdio()
     sys.exit(main())

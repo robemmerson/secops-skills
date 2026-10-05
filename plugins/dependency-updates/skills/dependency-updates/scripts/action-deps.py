@@ -54,7 +54,7 @@ def gh(path, jq=None):
     if jq:
         cmd += ["--jq", jq]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True)
+        out = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
     except FileNotFoundError:
         raise GhUnavailable("gh CLI not found: install it (https://cli.github.com) and run `gh auth login`")
     if out.returncode != 0:
@@ -235,7 +235,7 @@ def find_usages(paths):
     """Map owner/repo -> pins, locations, version comments, and per-sub-path inputs."""
     found = {}
     for f in workflow_files(paths):
-        text = f.read_text()
+        text = f.read_text(encoding="utf-8")
         for lineno, line in enumerate(text.splitlines(), 1):
             m = USES.match(line)
             if not m or m.group(1).startswith((".", "docker://")):
@@ -448,4 +448,6 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):  # Windows pipes default to cp1252
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.exit(main())

@@ -11,7 +11,8 @@ skill's base directory: the absolute path shown as "Base directory for this skil
 loads (it differs between a plugin install, a personal skill and Claude Desktop). Use the helper
 for every API call: it handles authentication, time parsing, response parsing, and several API
 traps that silently return wrong or empty results. Below, `devo.py` is short for
-`python3 <base directory>/scripts/devo.py`.
+`python3 <base directory>/scripts/devo.py`. On Windows, use `python` (or `py -3`) when `python3`
+isn't found, and put the path in quotes: the shell drops unquoted backslashes.
 
 The references hold **generic** Devo knowledge (LINQ, the APIs, Devo's standard parsers, the
 public detection library). Everything about *this* domain (which tables exist, their fields,
@@ -21,7 +22,8 @@ account naming, quirks) comes from the domain itself and is cached on the user's
 ## Setup and safety
 
 - Credentials: `DEVO_TOKEN` from the environment, otherwise from the env file named by
-  `DEVO_ENV_FILE`, otherwise `~/.config/devo/env` (`DEVO_TOKEN=...`, optional
+  `DEVO_ENV_FILE`, otherwise `~/.config/devo/env` on every OS (on Windows,
+  `%USERPROFILE%\.config\devo\env`; `%APPDATA%\devo\env` also works) (`DEVO_TOKEN=...`, optional
   `DEVO_REGION=eu|us|ca|apac|us3`, default `eu`, optional `DEVO_CACHE_KEY=<name>`). If
   `devo.py check` says no token was found, ask the user where it is. Don't go looking through
   their files for it.
@@ -53,7 +55,8 @@ if the token belongs to another region, and summarises the domain cache.
 ## Domain cache (first use, freshness, refetching)
 
 The first time a command needs domain data it fetches it live and caches it under
-`~/.cache/devo-skill/<domain key>/` (`$XDG_CACHE_HOME` or `$DEVO_CACHE_DIR` move it; files are
+`~/.cache/devo-skill/<domain key>/` (Windows: `%LOCALAPPDATA%\devo-skill\`; `$XDG_CACHE_HOME` or
+`$DEVO_CACHE_DIR` move it; files are
 private to the user; the token is never stored, only a hash of it names the directory unless
 `DEVO_CACHE_KEY` is set). What is cached, and when it expires:
 
