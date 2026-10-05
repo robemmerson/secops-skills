@@ -26,9 +26,11 @@ Query and investigate security data in a Devo domain, triage Devo alerts, and bu
 ## Domain data: fetched on first use, cached locally
 
 Nothing about a particular Devo domain ships with the skill. The first time it needs something it
-fetches it from the domain and caches it under `~/.cache/devo-skill/<domain key>/`: the table
+fetches it from the domain and caches it under `~/.cache/devo-skill/<domain key>/` (on Windows
+`%LOCALAPPDATA%\devo-skill\<domain key>\`): the table
 list, schemas, field profiles, the event-time expressions verified against real rows, and the
-sweep sources that hold up against the live schema. The directory is `0700` and the files `0600`.
+sweep sources that hold up against the live schema. The directory is `0700` and the files `0600`
+(on Windows, the user profile's permissions keep it private).
 The token itself is never written: the directory is named after a hash of it, or after
 `DEVO_CACHE_KEY`. Profiles keep data shapes only (types, fill rates, value patterns, and enum
 values of categorical fields), never identities.
@@ -50,7 +52,8 @@ values of categorical fields), never identities.
 
 ## Setup
 
-Put the Devo API token in `~/.config/devo/env` (`chmod 600`):
+Put the Devo API token in an env file. It's the same file on Windows, macOS and Linux:
+`~/.config/devo/env`, which on Windows is `%USERPROFILE%\.config\devo\env`.
 
 ```
 DEVO_TOKEN=...
@@ -58,12 +61,33 @@ DEVO_REGION=eu            # eu (default), us, ca, apac or us3
 DEVO_CACHE_KEY=my-domain  # optional: names the cache, so it survives token rotation
 ```
 
+macOS and Linux:
+
+```sh
+mkdir -p ~/.config/devo && touch ~/.config/devo/env && chmod 600 ~/.config/devo/env
+# then edit ~/.config/devo/env
+```
+
+Windows (PowerShell; files in your profile are private to you by default):
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME\.config\devo" | Out-Null
+notepad "$HOME\.config\devo\env"
+```
+
+The file can be saved in any common encoding (UTF-8 with or without a BOM, or the UTF-16 that
+Windows PowerShell's `>` writes) with LF or CRLF line ends. `export `, `set ` and `$env:` prefixes,
+quotes and trailing `# comments` are accepted. `$XDG_CONFIG_HOME/devo/env` is read first when that
+variable is set, and on Windows `%APPDATA%\devo\env` is read when `~/.config/devo/env` doesn't exist.
+
 The `DEVO_TOKEN`/`DEVO_REGION`/`DEVO_CACHE_KEY` environment variables, or `DEVO_ENV_FILE=<path>`,
 take precedence.
 
 ## Where it works
 
-- **Claude Code** (primary): needs Python 3.8+ and HTTPS access to `*.devo.com`.
+- **Claude Code** (primary) on Windows, macOS or Linux: needs Python 3.8+ and HTTPS access to
+  `*.devo.com`. `--tz` with a zone other than UTC needs Python 3.9+, and on Windows also the
+  `tzdata` package (`pip install tzdata`), since Windows has no system time-zone database.
 - **Claude Desktop / claude.ai** (zip upload): the scripts run in Claude's code-execution sandbox,
   which must be allowed to reach your region's API hosts (e.g. `apiv2-eu.devo.com` and
   `api-eu.devo.com`). There's no `~/.config/devo/env` there, so the token has to be provided

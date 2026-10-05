@@ -48,7 +48,8 @@ class StoreTests(CacheCase):
         c.put("tables", [["a.b", 1]])
         self.assertEqual((c.state("tables"), c.get("tables")), ("fresh", [["a.b", 1]]))
         mode = stat.S_IMODE(os.stat(c.path("tables")).st_mode)
-        self.assertEqual(mode & 0o077, 0, oct(mode))  # private to the user
+        if os.name != "nt":
+            self.assertEqual(mode & 0o077, 0, oct(mode))  # private to the user
         with mock.patch.object(devo.time, "time", lambda: c.read("tables")["fetched"] + 8 * devo.DAY):
             self.assertEqual(c.state("tables"), "expired")
             self.assertIsNone(c.get("tables"))
@@ -59,6 +60,7 @@ class StoreTests(CacheCase):
         self.assertIsNone(c.get("tables"))
         self.assertEqual(c.get("tables", allow_old=True), [["a.b", 1]])  # kept as a fallback
 
+    @unittest.skipIf(os.name == "nt", "POSIX modes; Windows relies on the profile's ACLs")
     def test_directories_are_private_from_the_root_down(self):
         root = os.path.join(tempfile.mkdtemp(), "devo-skill")
         old = os.umask(0o002)  # a permissive umask, as on many desktops
@@ -74,10 +76,11 @@ class StoreTests(CacheCase):
         c.put("tables", [])
         self.assertEqual(stat.S_IMODE(os.stat(root).st_mode), 0o700)
 
+    @unittest.skipIf(os.name == "nt", "POSIX modes; Windows relies on the profile's ACLs")
     def test_warns_about_a_readable_token_file(self):
         d = tempfile.mkdtemp()
         path = os.path.join(d, "env")
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write("DEVO_TOKEN=x\n")
         os.chmod(path, 0o644)
         devo._WARNED.clear()
@@ -90,7 +93,7 @@ class StoreTests(CacheCase):
         self.assertEqual(capped.ttl("fields/x.y"), devo.DAY / 2)
         self.assertIsNone(capped.ttl("notes"))  # notes never expire
         self.cache.put("tables", [])
-        with open(self.cache.path("tables"), "w") as f:
+        with open(self.cache.path("tables"), "w", encoding="utf-8") as f:
             json.dump({"version": 0, "fetched": 0, "data": []}, f)
         self.assertEqual(self.cache.state("tables"), "missing")  # an old format is ignored
 
@@ -172,7 +175,7 @@ class SourceTests(CacheCase):
             {"by": "user", "name": "absent", "table": "t.none", "filter": "weakhas(u, {T})", "group": "u"}],
             "graph": {"name": "graph", "table": "t.none", "filter": "id -> {T}", "group": "id"}}
         path = os.path.join(self.root, "hints.json")
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(hints, f)
         self.cache.put("tables", [["t.a", 10], ["t.b", 5], ["siem.logtrust.x", 9]])
         self.cache.put("fields/t.b", {"fields": {
@@ -273,7 +276,7 @@ class FieldMapTests(CacheCase):
 
     def test_roles_by_field_name_apply_to_every_table(self):
         path = os.path.join(self.root, "roles.json")
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump({"*": {"pid": None, "who": "user"}, "t.b": {"who": "host"}}, f)
         fm = {"tables": {"t.a": {"fields": {"pid": {"role": "join-id"}, "who": {}}},
                          "t.b": {"fields": {"who": {"role": "user"}}}}}
@@ -426,13 +429,13 @@ class Round2LessonTests(unittest.TestCase):
 class BatchQueryFileTests(unittest.TestCase):
     def test_query_file_next_to_the_spec(self):
         d = tempfile.mkdtemp()
-        with open(os.path.join(d, "q.linq"), "w") as f:
+        with open(os.path.join(d, "q.linq"), "w", encoding="utf-8") as f:
             f.write('from t.x where a = "quoted \\"value\\""')
-        with open(os.path.join(d, "spec.json"), "w") as f:
+        with open(os.path.join(d, "spec.json"), "w", encoding="utf-8") as f:
             json.dump([{"name": "j", "query_file": "q.linq"}], f)
         jobs = devo.load_spec(os.path.join(d, "spec.json"))
         self.assertIn('"quoted', jobs[0]["query"])
-        with open(os.path.join(d, "bad.json"), "w") as f:
+        with open(os.path.join(d, "bad.json"), "w", encoding="utf-8") as f:
             json.dump([{"name": "j", "query_file": "missing.linq"}], f)
         with self.assertRaises(devo.DevoError):
             devo.load_spec(os.path.join(d, "bad.json"))
@@ -500,9 +503,9 @@ class GrantsTests(unittest.TestCase):
                  "properties_category": "RoleManagement", "properties_loggedByService": "PIM",
                  "operationName": "Remove member from role in PIM completed (permanent)", "properties_result": "success",
                  "properties_initiatedBy_user_userPrincipalName": "admin@example.com", "targets": tr, "details": "[]"}]
-        with open(os.path.join(d, "entra_role_changes.jsonl"), "w") as f:
+        with open(os.path.join(d, "entra_role_changes.jsonl"), "w", encoding="utf-8") as f:
             f.write("\n".join(json.dumps(r) for r in recs))
-        with open(os.path.join(d, "ad_group_changes.jsonl"), "w") as f:
+        with open(os.path.join(d, "ad_group_changes.jsonl"), "w", encoding="utf-8") as f:
             f.write(json.dumps({"host": "srv01", "EventID": 4732, "TargetUserName": "Administrators",
                                 "SubjectUserName": "SRV01$", "MemberSid": "S-1-5-21-1-512", "n": 300}) + "\n")
         out = io.StringIO()

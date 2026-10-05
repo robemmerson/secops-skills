@@ -115,7 +115,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(c, {"token": "abc", "region": "eu"})
 
     def test_env_file(self):
-        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
             f.write('# comment\nexport DEVO_TOKEN="fromfile"\nDEVO_REGION=US\n')
         try:
             c = devo.load_config({"DEVO_ENV_FILE": f.name})
@@ -127,6 +127,68 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(devo.DevoError) as cm:
             devo.load_config({"DEVO_ENV_FILE": "/nonexistent"})
         self.assertEqual(cm.exception.code, 1)
+
+    def write_env(self, data):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "env")
+        with open(path, "wb") as f:
+            f.write(data)
+        os.chmod(path, 0o600)
+        return path
+
+    def test_env_file_from_windows_editors_and_shells(self):
+        body = 'DEVO_TOKEN=tok\r\nDEVO_REGION=us   # eu (default), us, ca, apac or us3\r\n'
+        for data in (body.encode("utf-8"),
+                     b"\xef\xbb\xbf" + body.encode("utf-8"),  # Notepad's UTF-8 with BOM
+                     body.encode("utf-16"),                    # Windows PowerShell's > and Out-File
+                     body.encode("utf-16-le")):                # UTF-16 without a BOM
+            with self.subTest(data=data[:4]):
+                c = devo.load_config({"DEVO_ENV_FILE": self.write_env(data)})
+                self.assertEqual(c, {"token": "tok", "region": "us"})
+
+    def test_env_file_prefixes_and_quotes(self):
+        path = self.write_env(b'set DEVO_TOKEN=a\n$env:DEVO_REGION = "ca"\nDEVO_CACHE_KEY=\'k#1\' # note\n')
+        self.assertEqual(devo.read_env_file(path), {"DEVO_TOKEN": "a", "DEVO_REGION": "ca", "DEVO_CACHE_KEY": "k#1"})
+
+    def test_env_file_location(self):
+        home = tempfile.mkdtemp()
+        usual = os.path.join(home, ".config", "devo", "env")
+        with mock.patch.object(devo.os.path, "expanduser", lambda p: p.replace("~", home, 1)):
+            self.assertEqual(devo.env_file_path({}), usual)  # nothing exists: the usual place
+            self.assertEqual(devo.env_file_path({"DEVO_ENV_FILE": "~/x"}), os.path.join(home, "x"))
+            xdg = os.path.join(home, "xdg")
+            self.assertEqual(devo.env_file_path({"XDG_CONFIG_HOME": xdg}), os.path.join(xdg, "devo", "env"))
+            appdata = os.path.join(home, "AppData", "Roaming")
+            os.makedirs(os.path.join(appdata, "devo"))
+            with open(os.path.join(appdata, "devo", "env"), "w", encoding="utf-8") as f:
+                f.write("DEVO_TOKEN=t\n")
+            with mock.patch.object(devo, "WINDOWS", True):
+                self.assertEqual(devo.env_file_path({"APPDATA": appdata}), os.path.join(appdata, "devo", "env"))
+                os.makedirs(os.path.dirname(usual))
+                with open(usual, "w", encoding="utf-8") as f:
+                    f.write("DEVO_TOKEN=t\n")
+                self.assertEqual(devo.env_file_path({"APPDATA": appdata}), usual)  # ~/.config wins
+            with mock.patch.object(devo, "WINDOWS", False):
+                self.assertNotIn(os.path.join(appdata, "devo", "env"), devo.env_file_paths({"APPDATA": appdata}))
+
+    def test_no_posix_mode_warning_on_windows(self):
+        path = self.write_env(b"DEVO_TOKEN=x\n")
+        err = io.StringIO()
+        devo._WARNED.clear()
+        with mock.patch.object(devo, "WINDOWS", True), contextlib.redirect_stderr(err):
+            devo.load_config({"DEVO_ENV_FILE": path})
+        self.assertEqual(err.getvalue(), "")
+
+    def test_cache_root_per_platform(self):
+        self.assertEqual(devo.cache_root({"XDG_CACHE_HOME": "xdg"}), os.path.join("xdg", "devo-skill"))
+        with mock.patch.object(devo, "WINDOWS", True):
+            self.assertEqual(devo.cache_root({"LOCALAPPDATA": "lad"}), os.path.join("lad", "devo-skill"))
+        with mock.patch.object(devo, "WINDOWS", False):
+            self.assertTrue(devo.cache_root({"LOCALAPPDATA": "lad"}).endswith(os.path.join(".cache", "devo-skill")))
+
+    def test_utc_needs_no_zone_database(self):
+        self.assertIs(devo.get_tz("UTC"), devo.dt.timezone.utc)
+        self.assertEqual(devo.to_local(0, devo.get_tz("utc")), "1970-01-01T00:00:00+00:00")
 
 
 class StreamTests(unittest.TestCase):
@@ -567,7 +629,7 @@ class ActivityTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.src = os.path.join(self.tmp, "sources.json")
-        with open(self.src, "w") as f:
+        with open(self.src, "w", encoding="utf-8") as f:
             json.dump(self.SOURCES, f)
         self.out = os.path.join(self.tmp, "out")
 
@@ -603,11 +665,11 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(len(signin), 4)  # 3h from 16:03:01 -> 4 hour-aligned chunks
         self.assertIn('from t.signin where weakhas(upn, "jsmith") group by upn, ip select count() as n',
                       signin[0]["query"])
-        with open(os.path.join(self.out, "signin.jsonl")) as f:
+        with open(os.path.join(self.out, "signin.jsonl"), encoding="utf-8") as f:
             rows = [json.loads(line) for line in f]
         merged = {r["upn"]: r["n"] for r in rows}
         self.assertEqual(merged, {"jsmith@example.com": 8, "svc-other@example.com": 4})  # re-aggregated
-        with open(os.path.join(self.out, "summary.json")) as f:
+        with open(os.path.join(self.out, "summary.json"), encoding="utf-8") as f:
             summ = {r["source"]: r for r in json.load(f)["sources"]}
         self.assertEqual(summ["signin"]["accounts"], ["jsmith@example.com"])  # only values matching the term
         self.assertEqual(summ["signin"]["events"], 12)
@@ -632,7 +694,7 @@ class ActivityTests(unittest.TestCase):
         conf["sources"] = self.SOURCES["sources"] + [
             {"name": "fw", "by": "ip", "table": "t.fw", "filter": "srcIp = {T} or dstIp = {T}",
              "group": "srcIp, dstIp", "accounts": ["srcIp", "dstIp"]}]
-        with open(self.src, "w") as f:
+        with open(self.src, "w", encoding="utf-8") as f:
             json.dump(conf, f)
 
         def route(q, frm, to):
@@ -731,9 +793,9 @@ class ProfileTests(unittest.TestCase):
                                                         "fields": devo.profile_rows(self.COLS, self.ROWS)})}}
         d = tempfile.mkdtemp()
         path, roles = os.path.join(d, "fm.json"), os.path.join(d, "roles.json")
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(fm, f)
-        with open(roles, "w") as f:
+        with open(roles, "w", encoding="utf-8") as f:
             json.dump({"t.one": {"host": "ip", "Message": None, "Nope": "user"}}, f)
         merged = devo.load_field_map(path, roles)
         self.assertEqual(merged["tables"]["t.one"]["fields"]["host"]["role"], "ip")
@@ -746,7 +808,7 @@ class ProfileTests(unittest.TestCase):
                          "t.two": {"window": "15m", "rows": 1, "fields": {"x": {"type": "str", "fill": 1.0,
                                                                                 "role": "user"}}}}}
         path = os.path.join(tempfile.mkdtemp(), "fm.json")
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(fm, f)
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(devo, "load_config", side_effect=AssertionError("no creds needed")), \
@@ -836,7 +898,7 @@ class CommentTests(unittest.TestCase):
 
 class WriteSurfaceTests(unittest.TestCase):
     def test_only_expected_writes(self):
-        with open(devo.__file__) as f:
+        with open(devo.__file__, encoding="utf-8") as f:
             src = f.read()
         for verb in ("updateStatus", "/tags", "alertDefinitions/status"):
             self.assertNotIn(verb, src)
@@ -928,7 +990,7 @@ class OutputControlTests(unittest.TestCase):
             code, out, err, _ = run_cli(["query", "from t select *", "--format", "csv", "--out", path],
                                         [FakeResp(COMPACT)])
             self.assertIn("# stats:", out)  # summary only on stdout
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 self.assertEqual(len(f.read().strip().splitlines()), 3)
             code, out, err, _ = run_cli(["query", "from t select *", "--out", path, "--no-summary"],
                                         [FakeResp(COMPACT)])
@@ -984,7 +1046,7 @@ class TermTests(unittest.TestCase):
 class EventTimeTests(unittest.TestCase):
     def test_map_is_well_formed_and_documented(self):
         fams = devo.load_event_time()
-        with open(os.path.join(devo.SKILL_DIR, "references", "table-guide.md")) as f:
+        with open(os.path.join(devo.SKILL_DIR, "references", "table-guide.md"), encoding="utf-8") as f:
             guide = f.read()
         self.assertIn("## Event time per family", guide)
         for fam in fams:
@@ -1033,7 +1095,7 @@ class ActivityTermsTests(ActivityTests):
                       reqs[0]["query"])
         self.assertIn("matched term (events)", out)
         self.assertIn("terms not matched in any source that names its term: nobody", err)
-        with open(os.path.join(self.out, "summary.json")) as f:
+        with open(os.path.join(self.out, "summary.json"), encoding="utf-8") as f:
             summ = json.load(f)
         self.assertEqual(summ["terms"], ["jsmith", "adm-jsmith", "nobody"])
         self.assertEqual(summ["sources"][0]["matched"], {"jsmith": 2, "adm-jsmith": 2})
@@ -1061,7 +1123,7 @@ class ActivityTermsTests(ActivityTests):
         code, _, err, _ = run_routed(["activity", "jsmith", "--from", "1h", "--only", "audit", "--tz", "UTC",
                                       "--out-dir", self.out, "--sources", self.src], self.route)
         self.assertEqual(code, 0, err)
-        with open(os.path.join(self.out, "audit.jsonl")) as f:
+        with open(os.path.join(self.out, "audit.jsonl"), encoding="utf-8") as f:
             rec = json.loads(f.readline())
         self.assertTrue(rec["eventdate_local"].endswith("+00:00"))
 
@@ -1093,7 +1155,7 @@ class LagTests(unittest.TestCase):
             code, stdout, err, reqs = run_routed(["lag", "--tables", "win_nxlog.security|box.unix", "--from", "3h",
                                                   "--table", "t.overflow", "--out", out], self.route)
             self.assertEqual(code, 0, err)
-            with open(out) as f:
+            with open(out, encoding="utf-8") as f:
                 res = {r["table"]: r for r in json.load(f)["tables"]}
         self.assertEqual(sorted(res), ["box.unix", "box.win_nxlog.security", "t.overflow"])  # --table always added
         sec = res["box.win_nxlog.security"]
@@ -1118,7 +1180,7 @@ class BatchTests(unittest.TestCase):
     def test_batch(self):
         with tempfile.TemporaryDirectory() as d:
             spec = os.path.join(d, "spec.jsonl")
-            with open(spec, "w") as f:
+            with open(spec, "w", encoding="utf-8") as f:
                 f.write('# comment\n')
                 f.write(json.dumps({"name": "a", "query": 'from t where u = "{user}", x in {1, 2} select u',
                                     "from": "{from}"}) + "\n")
@@ -1134,11 +1196,11 @@ class BatchTests(unittest.TestCase):
             self.assertIn("unreplaced placeholder(s) other", err)
             self.assertEqual(sorted(os.listdir(out)), ["a.jsonl", "a.log", "b.log", "batch-summary.json", "c.csv",
                                                        "c.log"])
-            with open(os.path.join(out, "a.jsonl")) as f:
+            with open(os.path.join(out, "a.jsonl"), encoding="utf-8") as f:
                 rec = json.loads(f.readline())
             self.assertEqual(rec["u"], "jsmith")
             self.assertIn("eventdate_local", rec)
-            with open(os.path.join(out, "b.log")) as f:
+            with open(os.path.join(out, "b.log"), encoding="utf-8") as f:
                 self.assertIn("Unknown identifier", f.read())
             self.assertIn("limit reached", stdout)
             a_from = [b for b in reqs if "select u" in b["query"] and "jsmith" in b["query"]][0]["from"]
@@ -1149,16 +1211,16 @@ class BatchTests(unittest.TestCase):
             spec = os.path.join(d, "spec.json")
             for jobs in ([{"name": "../x", "query": "from t"}], [{"name": "a"}],
                          [{"name": "a", "query": "q"}, {"name": "a", "query": "q"}]):
-                with open(spec, "w") as f:
+                with open(spec, "w", encoding="utf-8") as f:
                     json.dump(jobs, f)
                 code, _, err, reqs = run_routed(["batch", spec, "--out-dir", os.path.join(d, "o")], self.route)
                 self.assertEqual((code, reqs), (1, []), jobs)
         with tempfile.TemporaryDirectory() as d:  # a single job (JSONL with one line) is a valid spec
             spec = os.path.join(d, "one.jsonl")
-            with open(spec, "w") as f:
+            with open(spec, "w", encoding="utf-8") as f:
                 f.write(json.dumps({"name": "a", "query": 'from t where u = "x" select u'}) + "\n")
             self.assertEqual(len(devo.load_spec(spec)), 1)
-            with open(spec, "w") as f:
+            with open(spec, "w", encoding="utf-8") as f:
                 f.write(json.dumps({"name": "a", "query": "q", "limit": "500"}) + "\n")
             code, _, err, reqs = run_routed(["batch", spec, "--out-dir", os.path.join(d, "o")], self.route)
             self.assertEqual((code, reqs), (1, []))
@@ -1192,12 +1254,12 @@ class TimelineTests(unittest.TestCase):
         sources = []
         for name, (table, recs) in files.items():
             path = os.path.join(self.dir, f"{name}.jsonl")
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 for r in recs:
                     f.write(json.dumps(r) + "\n")
             sources.append({"source": name, "table": table, "rows": len(recs), "file": path,
                             "mode": "rows" if name == "o365_sharepoint" else "grouped"})
-        with open(os.path.join(self.dir, "summary.json"), "w") as f:
+        with open(os.path.join(self.dir, "summary.json"), "w", encoding="utf-8") as f:
             json.dump({"term": "j", "terms": ["j"], "window": ["a", "b"], "sources": sources}, f)
 
     def tearDown(self):
@@ -1205,10 +1267,10 @@ class TimelineTests(unittest.TestCase):
         shutil.rmtree(self.dir)
 
     def test_backfill_before_the_window_is_dropped(self):
-        with open(os.path.join(self.dir, "summary.json")) as f:
+        with open(os.path.join(self.dir, "summary.json"), encoding="utf-8") as f:
             summ = json.load(f)
         summ["window"] = ["2026-10-01T08:00:00Z", "2026-10-02T00:00:00Z"]
-        with open(os.path.join(self.dir, "summary.json"), "w") as f:
+        with open(os.path.join(self.dir, "summary.json"), "w", encoding="utf-8") as f:
             json.dump(summ, f)
         with mock.patch.object(devo, "load_config", side_effect=devo.DevoError("no Devo token found", code=1)):
             err = io.StringIO()
@@ -1216,9 +1278,9 @@ class TimelineTests(unittest.TestCase):
                 self.assertEqual(devo.main(["timeline", self.dir]), 0)
                 self.assertEqual(devo.main(["timeline", self.dir, "--keep-outside", "--out",
                                             os.path.join(self.dir, "all.json")]), 0)
-        with open(os.path.join(self.dir, "timeline.json")) as f:
+        with open(os.path.join(self.dir, "timeline.json"), encoding="utf-8") as f:
             kept = json.load(f)["events"]
-        with open(os.path.join(self.dir, "all.json")) as f:
+        with open(os.path.join(self.dir, "all.json"), encoding="utf-8") as f:
             every = json.load(f)["events"]
         self.assertTrue(all(e["t_utc"] >= "2026-10-01T08:00" for e in kept))
         self.assertGreater(len(every), len(kept))
@@ -1230,7 +1292,7 @@ class TimelineTests(unittest.TestCase):
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 code = devo.main(["timeline", self.dir, "--tz", "Europe/London"])
         self.assertEqual(code, 0, err.getvalue())
-        with open(os.path.join(self.dir, "timeline.json")) as f:
+        with open(os.path.join(self.dir, "timeline.json"), encoding="utf-8") as f:
             tl = json.load(f)
         ev = tl["events"]
         self.assertEqual([e["source"] for e in ev], ["linux", "entra_audit", "o365_sharepoint", "o365_sharepoint"])
@@ -1369,7 +1431,7 @@ class TeamsTests(unittest.TestCase):
             code, stdout, err, reqs = run_routed(["teams", "me@x.com", "--from", "2026-09-26", "--to", "2026-09-28",
                                                   "--out", out, "--tz", "Europe/London"], route)
             self.assertEqual(code, 0, err)
-            with open(out) as f:
+            with open(out, encoding="utf-8") as f:
                 model = json.load(f)
             self.assertEqual(model["subject"]["object_ids"], [self.ME])
             self.assertTrue(any("Operation not in" in b["query"] and "MessagesListed" in b["query"] for b in reqs))
@@ -1588,7 +1650,7 @@ class TimelineActorTests(unittest.TestCase):
         sources = []
         for name, (table, recs) in files.items():
             path = os.path.join(d, f"{name}.jsonl")
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 for r in recs:
                     f.write(json.dumps(r) + "\n")
             s = {"source": name, "table": table, "rows": len(recs), "file": path, "mode": "rows"}
@@ -1598,7 +1660,7 @@ class TimelineActorTests(unittest.TestCase):
                 s["actor_fields"] = devo.actor_fields(recipes[name])
                 s["target_fields"] = recipes[name].get("target") or []
             sources.append(s)
-        with open(os.path.join(d, "summary.json"), "w") as f:
+        with open(os.path.join(d, "summary.json"), "w", encoding="utf-8") as f:
             json.dump({"term": "x", "terms": ["x"], "window": ["a", "b"], "sources": sources}, f)
         roles = os.path.join(devo.HINTS, "field-roles.json")
         out = {}
