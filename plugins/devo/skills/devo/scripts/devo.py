@@ -49,7 +49,7 @@ expressions containing now() (e.g. "now() - 3h", "(now() - 1d) @ 1d"), passed th
 
 Exit codes: 0 ok, 1 usage/config error, 2 API error, 3 timeout.
 """
-import argparse, codecs, csv, datetime as dt, http.client, io, json, os, re, socket, stat, sys, threading, time
+import argparse, codecs, contextlib, csv, datetime as dt, http.client, io, json, os, re, socket, stat, sys, threading, time
 import urllib.error, urllib.parse, urllib.request
 
 VERSION = "1.0"
@@ -5837,6 +5837,31 @@ def cache_key(cfg, env=None):
     return f"{cfg['region']}-{digest}"
 
 
+def lock_file(f):
+    """Block until this process holds an exclusive lock on the open file f (fcntl on POSIX, msvcrt on Windows)."""
+    if WINDOWS:
+        import msvcrt
+        f.seek(0)
+        while True:
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)  # retries for ~10 s, then raises
+                return
+            except OSError:
+                continue
+    import fcntl
+    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+
+
+def unlock_file(f):
+    if WINDOWS:
+        import msvcrt
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
 class Cache:
     """One directory per domain, one JSON file per entry: {version, fetched, stale, data, ...}."""
 
@@ -5851,6 +5876,36 @@ class Cache:
             self.cap = float(cap) * DAY if cap else None
         except ValueError:
             raise DevoError(f"DEVO_CACHE_MAX_AGE_DAYS {cap!r} is not a number", code=1)
+        self._tlock = threading.RLock()
+        self._depth = 0
+        self._lockf = None
+
+    @contextlib.contextmanager
+    def lock(self):
+        """An advisory lock on <cache dir>/.lock around a read-modify-write, so helper processes that share
+        the cache (several at once under an MCP server, or a background `cache build`) don't lose each
+        other's changes. Re-entrant within a thread; single-entry writes don't need it (_write is atomic)."""
+        with self._tlock:
+            if self._depth == 0:
+                self.mkdirs(self.dir)
+                f = open(os.path.join(self.dir, ".lock"), "a+b")
+                try:
+                    lock_file(f)
+                except BaseException:
+                    f.close()
+                    raise
+                self._lockf = f
+            self._depth += 1
+            try:
+                yield self
+            finally:
+                self._depth -= 1
+                if self._depth == 0:
+                    f, self._lockf = self._lockf, None
+                    try:
+                        unlock_file(f)
+                    finally:
+                        f.close()
 
     def path(self, name):
         if not CACHE_NAME.match(name) or ".." in name:
@@ -5925,12 +5980,13 @@ class Cache:
 
     def invalidate(self, name, reason=""):
         """Mark an entry stale (kept as a fallback, refetched on next use). True if it changed."""
-        e = self.read(name)
-        if e is None or e.get("stale"):
-            return False
-        e.update(stale=True, stale_reason=reason)
-        self._write(name, e)
-        return True
+        with self.lock():
+            e = self.read(name)
+            if e is None or e.get("stale"):
+                return False
+            e.update(stale=True, stale_reason=reason)
+            self._write(name, e)
+            return True
 
     def drop(self, name):
         try:
@@ -5998,15 +6054,16 @@ def domain_tables(cfg, refresh=False, timeout=300):
         cache_say(f"live table list failed ({e}); using the cached copy")
         return [tuple(x) for x in old]
     if c:
-        before = cached_table_set()
-        old = c.read("tables") or {}
-        unq = set(old.get("unqueryable") or [])
-        if not refresh:  # keep tables known to be unqueryable out of an automatic refetch
-            rows = [r for r in rows if r[0] not in unq]
-        c.put("tables", rows, window=TABLES_WINDOW, unqueryable=sorted(unq) if not refresh else [])
-        if before is not None and before != {t for t, _ in rows}:
-            for n in ("sources", "event-time"):  # derived from the table list
-                c.invalidate(n, "table list changed")
+        with c.lock():
+            before = cached_table_set()
+            old = c.read("tables") or {}
+            unq = set(old.get("unqueryable") or [])
+            if not refresh:  # keep tables known to be unqueryable out of an automatic refetch
+                rows = [r for r in rows if r[0] not in unq]
+            c.put("tables", rows, window=TABLES_WINDOW, unqueryable=sorted(unq) if not refresh else [])
+            if before is not None and before != {t for t, _ in rows}:
+                for n in ("sources", "event-time"):  # derived from the table list
+                    c.invalidate(n, "table list changed")
     return [tuple(x) for x in rows]
 
 
@@ -6049,24 +6106,50 @@ def table_profile(cfg, table, refresh=False, sample=300, timeout=300):
     return prof
 
 
+def profile_signature(c):
+    """[[profile entry, mtime_ns, size]] of every cached profile: what a field map was built from."""
+    out = []
+    for n in c.names("fields/"):
+        try:
+            st = os.stat(c.path(n))
+        except OSError:
+            continue
+        out.append([n, st.st_mtime_ns, st.st_size])
+    return out
+
+
 def cached_field_map():
     """The merged field map (every cached profile, any age, with the curated roles applied), itself
-    cached as one file so `fields --role` and `timeline` don't read every profile each time."""
+    cached as one file so `fields --role` and `timeline` don't read every profile each time. It records
+    the profiles it was built from and is rebuilt when they differ, so a map written back by a reader
+    that started before a new profile landed doesn't hide that profile."""
     c = CACHE
     if not c:
         return {"tables": {}}
-    fm = c.get("field-map")
-    if fm is not None:
-        return fm
+    sig = profile_signature(c)
+    e = c.read("field-map")
+    if e is not None and c.state("field-map", e) == "fresh" and e.get("profiles") == sig:
+        return e["data"]
     tables = {}
-    for n in c.names("fields/"):
+    for n, _, _ in sig:
         d = c.get(n, allow_old=True)
         if d:
             tables[n.split("/", 1)[1]] = d
     fm = apply_roles({"tables": dict(sorted(tables.items()))}, FIELD_ROLES)
     if tables:
-        c.put("field-map", fm)
+        c.put("field-map", fm, profiles=sig)
     return fm
+
+
+def table_missing(cfg, table):
+    """True when the schema API answers 403/404 for the table (Devo's answer for one that doesn't exist).
+    Any other failure means we can't tell, so False."""
+    url = f"https://{REGIONS[cfg['region']][0]}/search/table/{urllib.parse.quote(table, safe='.')}"
+    try:
+        get_json(url, cfg["token"])
+    except DevoError as e:
+        return bool(re.search(r"HTTP (403|404)\b", str(e)))
+    return False
 
 
 def cache_mismatch(linq, err, cfg=None):
@@ -6077,19 +6160,28 @@ def cache_mismatch(linq, err, cfg=None):
         return
     msg = str(err)
     low = msg.lower()
-    tabs = re.findall(r"\bfrom\s+`?([A-Za-z0-9_.-]+)`?", linq)
+    tabs = re.findall(r"\bfrom\s+`?([A-Za-z0-9_.-]+)`?", blank_strings(linq))
     if "unknown table" in low or "access not allowed for table" in low:
-        bad = [t for t in tabs if t in (cached_table_set() or set())]
-        if bad:
-            # the collector counter can list a table that isn't queryable: drop it from the cached list
-            # and remember it, rather than refetching a list that would only bring it back
+        # only the table the message names, only if the query reads it, and only once the schema API
+        # agrees: a wrong mark hides a real table from coverage/lag/activity for everyone on this cache
+        m = re.search(r"(?:unknown table|access not allowed for table)\W+([A-Za-z0-9_.-]+)", msg, re.I)
+        bad = m.group(1) if m else None
+        if not bad or not cfg or bad not in tabs or bad not in (cached_table_set() or set()):
+            return
+        if not table_missing(cfg, bad):
+            return
+        # the collector counter can list a table that isn't queryable: drop it from the cached list
+        # and remember it, rather than refetching a list that would only bring it back
+        with c.lock():
             e = c.read("tables")
-            gone = set(e.get("unqueryable") or []) | set(bad)
+            if e is None:
+                return
+            gone = set(e.get("unqueryable") or []) | {bad}
             c.put("tables", [r for r in e["data"] if r[0] not in gone], window=e.get("window"),
                   unqueryable=sorted(gone))
-            c.invalidate("sources", f"{bad[0]} isn't queryable")
-            cache_say(f"{bad[0]} is listed by the collector counter but Devo says it doesn't exist: dropped from "
-                      "the cached table list (`tables --live` refetches the list)", noisy=True)
+            c.invalidate("sources", f"{bad} isn't queryable")
+        cache_say(f"{bad} is listed by the collector counter but Devo says it doesn't exist: dropped from "
+                  "the cached table list (`tables --live` refetches the list)", noisy=True)
     elif "unknown identifier" in low:
         m = re.search(r"identifier\W+`?([A-Za-z_]\w*)", msg, re.I)
         if not m:
@@ -6361,6 +6453,79 @@ def print_cache_status(s):
       + f"; naming {n['naming']}")
 
 
+def cache_edit_notes(act, what):
+    """`cache note|service|naming`: edit the notes entry. The caller holds the cache lock."""
+    if act == "note":
+        d = load_notes()
+        if not what:
+            raise DevoError("cache note add TEXT | verify ID | rm ID", code=1)
+        sub, rest = what[0], what[1:]
+        now = int(time.time())
+        if sub == "add":
+            text = " ".join(rest).strip()
+            if not text:
+                raise DevoError("cache note add needs the note text", code=1)
+            nid = max([x["id"] for x in d["notes"]] + [0]) + 1
+            d["notes"].append({"id": nid, "text": text, "added": now, "verified": now})
+            save_notes(d)
+            print(f"note {nid} added")
+            return 0
+        if sub in ("verify", "rm") and rest:
+            ids = {int(x) for x in rest if x.isdigit()}
+            hit = [x for x in d["notes"] if x["id"] in ids]
+            if not hit:
+                raise DevoError(f"no note with id {', '.join(rest)}", "list them with `devo.py cache notes`", code=1)
+            if sub == "rm":
+                d["notes"] = [x for x in d["notes"] if x["id"] not in ids]
+            else:
+                for x in hit:
+                    x["verified"] = now
+            save_notes(d)
+            print(f"{'removed' if sub == 'rm' else 're-verified'} {len(hit)} note(s)")
+            return 0
+        raise DevoError("cache note add TEXT | verify ID | rm ID", code=1)
+    if act == "service":
+        d = load_notes()
+        if not what or what[0] == "show":
+            print(", ".join(d.get("service_accounts") or []) or "(none recorded)")
+            return 0
+        if what[0] == "reset":
+            d["service_accounts"] = []
+        elif what[0] in ("set", "add") and len(what) > 1:
+            new_ = [x.strip() for x in ",".join(what[1:]).split(",") if x.strip()]
+            bad = [x for x in new_ if not re.fullmatch(r"[A-Za-z0-9_.@$*?\-\[\]]+", x)]
+            if bad:
+                raise DevoError(f"service pattern {bad[0]!r}: use account-name globs like svc-*, ec2-user", code=1)
+            d["service_accounts"] = list(dict.fromkeys(((d.get("service_accounts") or []) if what[0] == "add" else [])
+                                                       + new_))
+        else:
+            raise DevoError("cache service show | set GLOB[,GLOB...] | add GLOB[,...] | reset", code=1)
+        save_notes(d)
+        print("service accounts: " + (", ".join(d["service_accounts"]) or "(none)"))
+        return 0
+    if act == "naming":
+        d = load_notes()
+        if not what or what[0] == "show":
+            print(", ".join(naming_templates()) + ("" if d.get("naming") else "  (default)"))
+            return 0
+        if what[0] == "reset":
+            d["naming"] = None
+        elif what[0] == "set" and len(what) > 1:
+            tpl = [x.strip() for x in ",".join(what[1:]).split(",") if x.strip()]
+            for x in tpl:
+                bad = set(re.findall(r"\{(\w*)\}", x)) - {"upn", "local", "first", "last", "f", "l"}
+                if bad or not re.fullmatch(r"[A-Za-z0-9_.@$\-{}]+", x):
+                    raise DevoError(f"naming template {x!r}: use {{upn}} {{local}} {{first}} {{last}} {{f}} {{l}} "
+                                    "and letters, digits, . _ @ $ -", code=1)
+            d["naming"] = tpl
+        else:
+            raise DevoError("cache naming show | set TEMPLATE[,TEMPLATE...] | reset", code=1)
+        save_notes(d)
+        print("naming: " + ", ".join(naming_templates()))
+        return 0
+    raise DevoError(f"unknown cache action {act!r}", code=1)
+
+
 def cmd_cache(cfg, a):
     from concurrent.futures import ThreadPoolExecutor
     c = CACHE
@@ -6516,74 +6681,9 @@ def cmd_cache(cfg, a):
         print(f"# {len(d['notes'])} notes; naming {d.get('naming') or 'default ' + str(DEFAULT_NAMING)}",
               file=sys.stderr)
         return 0
-    if act == "note":
-        d = load_notes()
-        if not what:
-            raise DevoError("cache note add TEXT | verify ID | rm ID", code=1)
-        sub, rest = what[0], what[1:]
-        now = int(time.time())
-        if sub == "add":
-            text = " ".join(rest).strip()
-            if not text:
-                raise DevoError("cache note add needs the note text", code=1)
-            nid = max([x["id"] for x in d["notes"]] + [0]) + 1
-            d["notes"].append({"id": nid, "text": text, "added": now, "verified": now})
-            save_notes(d)
-            print(f"note {nid} added")
-            return 0
-        if sub in ("verify", "rm") and rest:
-            ids = {int(x) for x in rest if x.isdigit()}
-            hit = [x for x in d["notes"] if x["id"] in ids]
-            if not hit:
-                raise DevoError(f"no note with id {', '.join(rest)}", "list them with `devo.py cache notes`", code=1)
-            if sub == "rm":
-                d["notes"] = [x for x in d["notes"] if x["id"] not in ids]
-            else:
-                for x in hit:
-                    x["verified"] = now
-            save_notes(d)
-            print(f"{'removed' if sub == 'rm' else 're-verified'} {len(hit)} note(s)")
-            return 0
-        raise DevoError("cache note add TEXT | verify ID | rm ID", code=1)
-    if act == "service":
-        d = load_notes()
-        if not what or what[0] == "show":
-            print(", ".join(d.get("service_accounts") or []) or "(none recorded)")
-            return 0
-        if what[0] == "reset":
-            d["service_accounts"] = []
-        elif what[0] in ("set", "add") and len(what) > 1:
-            new_ = [x.strip() for x in ",".join(what[1:]).split(",") if x.strip()]
-            bad = [x for x in new_ if not re.fullmatch(r"[A-Za-z0-9_.@$*?\-\[\]]+", x)]
-            if bad:
-                raise DevoError(f"service pattern {bad[0]!r}: use account-name globs like svc-*, ec2-user", code=1)
-            d["service_accounts"] = list(dict.fromkeys(((d.get("service_accounts") or []) if what[0] == "add" else [])
-                                                       + new_))
-        else:
-            raise DevoError("cache service show | set GLOB[,GLOB...] | add GLOB[,...] | reset", code=1)
-        save_notes(d)
-        print("service accounts: " + (", ".join(d["service_accounts"]) or "(none)"))
-        return 0
-    if act == "naming":
-        d = load_notes()
-        if not what or what[0] == "show":
-            print(", ".join(naming_templates()) + ("" if d.get("naming") else "  (default)"))
-            return 0
-        if what[0] == "reset":
-            d["naming"] = None
-        elif what[0] == "set" and len(what) > 1:
-            tpl = [x.strip() for x in ",".join(what[1:]).split(",") if x.strip()]
-            for x in tpl:
-                bad = set(re.findall(r"\{(\w*)\}", x)) - {"upn", "local", "first", "last", "f", "l"}
-                if bad or not re.fullmatch(r"[A-Za-z0-9_.@$\-{}]+", x):
-                    raise DevoError(f"naming template {x!r}: use {{upn}} {{local}} {{first}} {{last}} {{f}} {{l}} "
-                                    "and letters, digits, . _ @ $ -", code=1)
-            d["naming"] = tpl
-        else:
-            raise DevoError("cache naming show | set TEMPLATE[,TEMPLATE...] | reset", code=1)
-        save_notes(d)
-        print("naming: " + ", ".join(naming_templates()))
-        return 0
+    if act in ("note", "service", "naming"):
+        with c.lock():  # read-modify-write of the notes entry: two `note add` at once must not share an id
+            return cache_edit_notes(act, what)
     raise DevoError(f"unknown cache action {act!r}", code=1)
 
 

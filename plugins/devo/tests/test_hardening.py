@@ -76,6 +76,122 @@ class QueryFileTests(unittest.TestCase):
                 self.assertTrue(all(j.get("query") for j in jobs))
 
 
+class MismatchTests(CacheCase):
+    """2. Only the table the error names is marked unqueryable, and only after a schema lookup agrees."""
+
+    def setUp(self):
+        super().setUp()
+        self.cache.put("tables", [["t.a", 5], ["t.b", 4], ["t.c", 3]])
+
+    def test_only_the_named_table_is_marked(self):
+        q = 'from t.a where x in (from t.b select x), msg = "from t.c"'
+        with mock.patch.object(devo, "table_missing", return_value=True) as look:
+            devo.cache_mismatch(q, devo.DevoError("HTTP 500: Unknown table `t.b`"), CFG)
+        look.assert_called_once_with(CFG, "t.b")
+        self.assertEqual(self.cache.read("tables")["unqueryable"], ["t.b"])
+        self.assertEqual([t for t, _ in self.cache.get("tables")], ["t.a", "t.c"])
+
+    def test_table_names_inside_strings_are_ignored(self):
+        q = 'from t.a where msg = "Unknown table `t.c`"'
+        with mock.patch.object(devo, "table_missing", return_value=True):
+            devo.cache_mismatch(q, devo.DevoError("HTTP 500: Unknown table `t.c`"), CFG)
+        self.assertEqual(self.cache.state("tables"), "fresh")
+        self.assertEqual(len(self.cache.get("tables")), 3)
+
+    def test_a_schema_lookup_that_finds_the_table_writes_nothing(self):
+        with mock.patch.object(devo, "table_missing", return_value=False):
+            devo.cache_mismatch("from t.a select *", devo.DevoError("HTTP 403: Access not allowed for table t.a"), CFG)
+        self.assertEqual(len(self.cache.get("tables")), 3)
+        self.assertNotIn("unqueryable", self.cache.read("tables"))
+
+    def test_no_name_or_no_credentials_writes_nothing(self):
+        with mock.patch.object(devo, "table_missing", return_value=True):
+            devo.cache_mismatch("from t.a select *", devo.DevoError("HTTP 403: Access not allowed for table"), CFG)
+            devo.cache_mismatch("from t.a select *", devo.DevoError("Unknown table `t.a`"), None)
+        self.assertEqual(len(self.cache.get("tables")), 3)
+
+    def test_table_missing_reads_the_schema_status(self):
+        with mock.patch.object(devo, "get_json", side_effect=devo.DevoError("HTTP 403: Access not allowed")):
+            self.assertTrue(devo.table_missing(CFG, "t.a"))
+        with mock.patch.object(devo, "get_json", side_effect=devo.DevoError("HTTP 404: not found")):
+            self.assertTrue(devo.table_missing(CFG, "t.a"))
+        with mock.patch.object(devo, "get_json", return_value={"object": [{"fieldName": "a", "type": "str"}]}):
+            self.assertFalse(devo.table_missing(CFG, "t.a"))
+        with mock.patch.object(devo, "get_json", side_effect=devo.DevoError("HTTP 503: busy")):
+            self.assertFalse(devo.table_missing(CFG, "t.a"))  # can't tell: don't touch the cache
+
+
+class LockTests(CacheCase):
+    """5. Read-modify-write sequences hold <cache dir>/.lock; the field map knows which profiles it holds."""
+
+    def test_the_lock_excludes_another_process(self):
+        code = ("import sys, time; sys.path.insert(0, sys.argv[1]); import devo; "
+                "c = devo.Cache({'token': 'x', 'region': 'eu'}, root=sys.argv[2], env={})\n"
+                "with c.lock():\n    print('locked', flush=True); time.sleep(1.5)\n")
+        p = subprocess.Popen([sys.executable, "-c", code, SCRIPTS, self.root], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(p.stdout.readline().strip(), "locked")
+            mine = devo.Cache({"token": "x", "region": "eu"}, root=self.root, env={})
+            start = time.time()
+            with mine.lock():
+                waited = time.time() - start
+            self.assertGreater(waited, 0.5)
+        finally:
+            p.wait(10)
+            p.stdout.close()
+
+    def test_the_lock_is_reentrant_in_one_thread(self):
+        with self.cache.lock():
+            with self.cache.lock():
+                self.cache.invalidate("tables")
+
+    def test_parallel_note_adds_keep_every_note(self):
+        def add(i):
+            devo.cmd_cache(CFG, argparse_ns(action="note", what=["add", f"note {i}"], json=False))
+
+        threads = [threading.Thread(target=add, args=(i,)) for i in range(20)]
+        with contextlib.redirect_stdout(io.StringIO()):  # once: redirect_stdout isn't thread-safe
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        notes = devo.load_notes()["notes"]
+        self.assertEqual(len(notes), 20)
+        self.assertEqual(len({n["id"] for n in notes}), 20)
+
+    def test_read_modify_writes_take_the_lock(self):
+        taken = []
+        real = devo.Cache.lock
+
+        def spy(self_):
+            taken.append(1)
+            return real(self_)
+
+        self.cache.put("tables", [["t.a", 1]])
+        self.cache.put("sources", {"sources": []})
+        with mock.patch.object(devo.Cache, "lock", spy):
+            self.cache.invalidate("sources", "x")
+            self.assertTrue(taken, "invalidate")
+            taken.clear()
+            with mock.patch.object(devo, "table_missing", return_value=True):
+                devo.cache_mismatch("from t.a select *", devo.DevoError("Unknown table `t.a`"), CFG)
+            self.assertTrue(taken, "cache_mismatch")
+            taken.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                devo.cmd_cache(CFG, argparse_ns(action="naming", what=["set", "{upn}"], json=False))
+            self.assertTrue(taken, "naming set")
+
+    def test_a_field_map_built_before_a_new_profile_is_rebuilt(self):
+        self.cache.put("fields/t.a", {"fields": {"x": {"type": "str"}}, "empty": []})
+        self.assertEqual(set(devo.cached_field_map()["tables"]), {"t.a"})
+        # a profile written after the map, without dropping it (a reader that raced the writer)
+        self.cache.put("fields/t.b", {"fields": {"y": {"type": "str"}}, "empty": []})
+        self.assertEqual(set(devo.cached_field_map()["tables"]), {"t.a", "t.b"})
+        # unchanged profiles: the cached map is served as is
+        with mock.patch.object(devo, "apply_roles", side_effect=AssertionError("rebuilt")):
+            devo.cached_field_map()
+
+
 def argparse_ns(**kw):
     import argparse
     kw.setdefault("what", [])
