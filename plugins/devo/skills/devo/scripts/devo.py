@@ -649,7 +649,7 @@ def chunk_step(chunk):
     return step
 
 
-MAX_PARALLEL = 8  # concurrent windows per query (`query --parallel`, a batch job's `parallel`)
+MAX_PARALLEL = 8  # concurrent windows per batch job (`parallel` in a spec, which can come from an MCP client)
 MIN_SPLIT = 300  # seconds: --auto-split stops halving a window below this
 MAX_SPLITS = 64  # halvings per fetch(), so a filter that matches everything can't fan out without end
 AUTO_SPLIT_MIN_LIMIT = 1000  # below this a --limit is a sample, not a collection: don't split by default
@@ -1024,9 +1024,6 @@ def feed_gaps(cfg, tables, frm_s, to_s, timeout=300, slack=6 * 3600):
 
 
 def cmd_query(cfg, a):
-    if a.parallel > MAX_PARALLEL:
-        print(f"# warning: --parallel {a.parallel} clamped to {MAX_PARALLEL}", file=sys.stderr)
-        a.parallel = MAX_PARALLEL
     linq = a.linq if a.linq != "-" else sys.stdin.read()
     linq = re.sub(r"^(\s*from\s+)(\S+)", lambda m: m.group(1) + quote_table(m.group(2)), linq, count=1)
     frm, frm_s = resolve_time(a.from_)

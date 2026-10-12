@@ -388,7 +388,7 @@ class LinqStringTests(unittest.TestCase):
 
 
 class BatchParallelTests(unittest.TestCase):
-    """11. A job's `parallel` is clamped to the same maximum as `query --parallel`."""
+    """11. A batch job's `parallel` is clamped to MAX_PARALLEL; `query --parallel` has no cap."""
 
     def test_job_parallel_is_clamped(self):
         d = tempfile.mkdtemp()
@@ -406,7 +406,7 @@ class BatchParallelTests(unittest.TestCase):
         self.assertEqual(seen, [devo.MAX_PARALLEL])
         self.assertIn("parallel", err)
 
-    def test_query_parallel_is_clamped(self):
+    def test_query_parallel_is_not_clamped(self):  # the cap is for batch jobs only
         seen = []
 
         def fake_fetch(cfg, linq, frm, to, limit, timeout, chunk=None, parallel=4, *a, **k):
@@ -417,8 +417,8 @@ class BatchParallelTests(unittest.TestCase):
             code, out, err, _ = run_cli(["query", "from t.x select a", "--from", "2h", "--to", "1h", "--chunk", "1h",
                                          "--parallel", "64"], [])
         self.assertEqual(code, 0, err)
-        self.assertEqual(seen, [devo.MAX_PARALLEL])
-        self.assertIn("parallel", err)
+        self.assertEqual(seen, [64])
+        self.assertNotIn("clamped", err)
 
 
 class SummaryPathTests(unittest.TestCase):
