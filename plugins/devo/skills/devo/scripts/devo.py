@@ -2586,7 +2586,7 @@ def cmd_activity(cfg, a):
                "seconds": round(time.time() - start), "sources": results, "feed_gaps": feed_gaps}
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=1, ensure_ascii=False)
-    print_activity(summary, a.width)
+    print_activity(summary, a.width, out_dir)
     return 0
 
 
@@ -2607,7 +2607,7 @@ def mark_duplicates(results):
             seen[k] = r["source"]
 
 
-def print_activity(summary, width):
+def print_activity(summary, width, out_dir):
     res = summary["sources"]
     multi = len(summary.get("terms") or []) > 1
     rows = []
@@ -2657,12 +2657,21 @@ def print_activity(summary, width):
     print(f"# errors ({len(errors)}): {', '.join(errors) or '-'}   limit reached: {', '.join(limited) or '-'}",
           file=sys.stderr)
     oids = sorted({r.get("properties_userId") for x in res if x["source"].startswith("entra_") and x.get("file")
-                   for r in _read_jsonl(x["file"]) if r.get("properties_userId")})
+                   for r in _read_jsonl(inside_dir(out_dir, x["file"])) if r.get("properties_userId")})
     if oids and not any(x["source"].startswith("graph_") for x in res):
         print(f"# Graph second pass: --graph-ids {','.join(oids)} (object ids seen in the sign-ins)", file=sys.stderr)
 
 
+def inside_dir(d, path):
+    """d joined with only the last component of a path read back from summary.json (None if there is none),
+    so a summary that names a file elsewhere can't make us read it."""
+    name = re.split(r"[\\/]", str(path or ""))[-1]
+    return os.path.join(d, name) if name not in ("", ".", "..") else None
+
+
 def _read_jsonl(path):
+    if not path:
+        return []
     try:
         with open(path, encoding="utf-8") as f:
             return [json.loads(line) for line in f if line.strip()]
@@ -3225,6 +3234,28 @@ SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 EXT = {"jsonl": "jsonl", "json": "json", "csv": "csv", "tsv": "tsv", "table": "txt"}
 
 
+def spec_query_file(base, rel, name=None):
+    """The real path of a job's query_file: a relative .linq path that stays under the spec's folder
+    (no absolute path, ~ or .., and no symlink out), because its text is copied into <name>.log."""
+    what = f"job {name}: query_file {rel!r}"
+    if not isinstance(rel, str) or not rel.strip():
+        raise DevoError(f"{what}: must be a file name", code=1)
+    parts = re.split(r"[\\/]", rel)
+    if (os.path.isabs(rel) or rel[:1] in ("/", "\\", "~") or re.match(r"^[A-Za-z]:", rel) or ".." in parts
+            or not rel.lower().endswith(".linq")):
+        raise DevoError(f"{what}: use a relative path to a .linq file in the spec's folder (no /, ~ or ..)",
+                        code=1)
+    root = os.path.realpath(base)
+    real = os.path.realpath(os.path.join(root, *parts))
+    try:
+        inside = os.path.commonpath([root, real]) == root
+    except ValueError:  # Windows: another drive
+        inside = False
+    if not inside or not real.lower().endswith(".linq"):
+        raise DevoError(f"{what}: resolves outside the spec's folder", code=1)
+    return real
+
+
 def load_spec(path):
     """Jobs from a JSON list, {"jobs": [...]}, or JSON Lines."""
     if path == "-":
@@ -3245,7 +3276,7 @@ def load_spec(path):
     base = os.path.dirname(os.path.abspath(path)) if path != "-" else os.getcwd()
     for j in jobs:  # "query_file": a .linq file next to the spec, so LINQ quotes need no JSON escaping
         if "query_file" in j and "query" not in j:
-            qp = os.path.join(base, os.path.expanduser(j["query_file"]))
+            qp = spec_query_file(base, j["query_file"], j.get("name"))
             try:
                 with open(qp, encoding="utf-8-sig") as f:
                     j["query"] = f.read()
@@ -3557,12 +3588,10 @@ def build_timeline(act_dir, tz=None, fm=None, families=None):
     for src in summary["sources"]:
         if src.get("error") or src.get("duplicate_of"):
             continue
-        path = src.get("file") or f"{src['source']}.jsonl"
-        if not os.path.exists(path):  # the directory was moved or copied: look next to summary.json
-            path = os.path.join(act_dir, os.path.basename(path))
-        if not os.path.exists(path):
+        path = inside_dir(act_dir, src.get("file") or f"{src['source']}.jsonl")  # next to summary.json only
+        if not path or not os.path.isfile(path):
             if src.get("rows"):
-                notes.append(f"{src['source']}: {os.path.basename(path)} is missing from {act_dir}")
+                notes.append(f"{src['source']}: {os.path.basename(path or '') or src.get('file')} is missing from {act_dir}")
             continue
         table, fam = src["table"], event_time_for(src["table"], families)
         role = field_roles(table, fm)
