@@ -121,6 +121,42 @@ class MismatchTests(CacheCase):
             self.assertFalse(devo.table_missing(CFG, "t.a"))  # can't tell: don't touch the cache
 
 
+class StreamTests(unittest.TestCase):
+    """3 and 4: multi-byte characters across reads, and a quiet socket."""
+
+    def test_utf8_split_across_reads(self):
+        body = ('{"m":{"u":{"type":"str","index":0}}}\n{"d":["José Ñúñez 日本"]}\n').encode("utf-8")
+        with mock.patch.object(devo, "http_open", return_value=FakeResp(body, chunk=1)):
+            rows = [r for _, r in devo.run_query(CFG, "from t.x", 1, 2, 0, 60) if r]
+        self.assertEqual(rows, [["José Ñúñez 日本"]])
+
+    def test_a_read_timeout_ends_the_attempt_without_a_retry(self):
+        class Quiet(FakeResp):
+            def __init__(self):
+                super().__init__(b"")
+                self.timed_out = False
+
+            def read1(self, n):
+                if self.timed_out:  # what CPython's SocketIO does after a timeout
+                    raise OSError("cannot read from timed out object")
+                self.timed_out = True
+                raise socket.timeout("timed out")
+
+        calls = []
+
+        def opener(*a, **k):
+            calls.append(1)
+            return Quiet()
+
+        with mock.patch.object(devo, "http_open", opener), mock.patch.object(devo, "RETRY_DELAY", 0):
+            with self.assertRaises(devo.DevoError) as cm:
+                devo.fetch(CFG, "from t.x select *", 1, 2, 10, 600)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(cm.exception.code, 3)
+        self.assertNotIn("connection dropped", str(cm.exception))
+        self.assertIn("no data", str(cm.exception))
+
+
 class LockTests(CacheCase):
     """5. Read-modify-write sequences hold <cache dir>/.lock; the field map knows which profiles it holds."""
 
@@ -202,6 +238,68 @@ ALERT = {"id": 1, "createDate": 1000, "status": 0, "priority": 5, "context": "my
          "alertDefinition": {"name": "Rule"}, "extraData": "{}"}
 
 
+class AlertPagingTests(unittest.TestCase):
+    """6. Paging ends when the API repeats itself, and at a hard page cap."""
+
+    def test_a_repeated_page_ends_the_loop(self):
+        def same_page():
+            for _ in range(50):  # a loop that never stops fails here instead of hanging
+                yield FakeResp(json.dumps([dict(ALERT, id=1), dict(ALERT, id=2)]))
+
+        code, out, err, reqs = run_cli(["alerts", "--format", "json"], same_page())
+        self.assertEqual(code, 0)
+        self.assertEqual(len(reqs), 1 + devo.STALE_ALERT_PAGES)
+        self.assertEqual(sorted(x["id"] for x in json.loads(out)), [1, 2])
+
+    def test_short_pages_do_not_end_the_loop(self):
+        # the API often returns fewer than PAGE items while more exist, and pages can overlap
+        pages = [[dict(ALERT, id=1), dict(ALERT, id=2)], [dict(ALERT, id=2)], [dict(ALERT, id=3)],
+                 [dict(ALERT, id=4), dict(ALERT, id=5)], []]
+        code, out, err, reqs = run_cli(["alerts", "--format", "json"], [FakeResp(json.dumps(p)) for p in pages])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(reqs), 5)
+        self.assertEqual(sorted(x["id"] for x in json.loads(out)), [1, 2, 3, 4, 5])
+
+    def test_a_page_cap_stops_an_endless_api(self):
+        def endless():
+            for n in range(1, 50):
+                yield FakeResp(json.dumps([dict(ALERT, id=n)]))
+
+        with mock.patch.object(devo, "MAX_ALERT_PAGES", 5):
+            code, out, err, reqs = run_cli(["alerts", "--format", "json", "--max", "100000"], endless())
+        self.assertEqual(code, 0)
+        self.assertEqual(len(reqs), 5)
+        self.assertIn("page", err)
+
+
+class RedirectTests(unittest.TestCase):
+    """7. The token never follows a redirect off *.devo.com."""
+
+    def redirect(self, to, frm="https://apiv2-eu.devo.com/search/query"):
+        req = urllib.request.Request(frm, headers={"Authorization": "Bearer T", "standAloneToken": "T"})
+        h = devo.SafeRedirect()
+        return h.redirect_request(req, io.BytesIO(), 302, "Found", {}, to)
+
+    def test_off_domain_and_plain_http_are_refused(self):
+        for to in ("https://evil.example.com/x", "https://devo.com.example.com/x", "http://apiv2-eu.devo.com/x",
+                   "https://example.com/?h=.devo.com"):
+            with self.subTest(to=to):
+                with self.assertRaises(devo.DevoError):
+                    self.redirect(to)
+
+    def test_another_devo_host_gets_no_token(self):
+        new = self.redirect("https://other.devo.com/x")
+        self.assertIsNone(new.get_header("Authorization"))
+        self.assertIsNone(new.get_header("Standalonetoken"))
+
+    def test_same_host_keeps_the_token(self):
+        new = self.redirect("https://apiv2-eu.devo.com/other")
+        self.assertEqual(new.get_header("Authorization"), "Bearer T")
+
+    def test_requests_go_through_the_safe_opener(self):
+        self.assertTrue(any(isinstance(h, devo.SafeRedirect) for h in devo.OPENER.handlers))
+
+
 class BadInputTests(unittest.TestCase):
     """8. Bad input gives `ERROR:` and a hint, never a traceback."""
 
@@ -224,6 +322,7 @@ class BadInputTests(unittest.TestCase):
         self.assert_clean(["tables", "--grep", "("])
         self.assert_clean(["boards", "--grep", "("])
         self.assert_clean(["lag", "--tables", "("])
+        self.assert_clean(["alerts", "--group-by", "user,("])
 
     def test_non_integer_board_layout(self):
         d = tempfile.mkdtemp()

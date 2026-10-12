@@ -342,6 +342,31 @@ def add_local_fields(rec, tz, fields=("eventdate", "first", "last", "first_event
 
 # ---------------------------------------------------------------- HTTP
 
+DEVO_HOST = re.compile(r"(^|\.)devo\.com$")
+
+
+class SafeRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only to https://*.devo.com, and drop the token headers when the host changes:
+    urllib's default handler copies Authorization and standAloneToken to wherever a redirect points."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is None:
+            return None
+        u = urllib.parse.urlsplit(new.full_url)
+        host = (u.hostname or "").lower()
+        if u.scheme != "https" or not DEVO_HOST.search(host):
+            raise DevoError(f"refused a redirect to {u.scheme}://{host}: the token is only sent to https://*.devo.com",
+                            "check the region (`devo.py check`) and any proxy in between")
+        if host != (urllib.parse.urlsplit(req.full_url).hostname or "").lower():
+            for h in ("Authorization", "Standalonetoken"):
+                new.remove_header(h)
+        return new
+
+
+OPENER = urllib.request.build_opener(SafeRedirect)
+
+
 def http_open(method, url, token, body=None, headers=None, timeout=60):
     """Open a request; return the response object or raise DevoError with a readable message."""
     h = {"User-Agent": USER_AGENT, "Accept": "application/json", "Authorization": f"Bearer {token}"}
@@ -351,7 +376,7 @@ def http_open(method, url, token, body=None, headers=None, timeout=60):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, headers=h, method=method)
     try:
-        return urllib.request.urlopen(req, timeout=timeout)
+        return OPENER.open(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         raise api_error(e.code, e.read().decode("utf-8", "replace"), token)
     except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
@@ -498,7 +523,9 @@ def run_query(cfg, linq, frm, to, limit, timeout, ip_as_string=True):
     url = f"https://{REGIONS[cfg['region']][0]}/search/query"
     deadline = time.time() + timeout
     parser = CompactStream()
-    resp = http_open("POST", url, cfg["token"], body=body, timeout=min(timeout, 120))
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")  # a character can span two reads
+    read_timeout = min(timeout, 120)
+    resp = http_open("POST", url, cfg["token"], body=body, timeout=read_timeout)
     with resp:
         while True:
             if time.time() > deadline:
@@ -508,15 +535,19 @@ def run_query(cfg, linq, frm, to, limit, timeout, ip_as_string=True):
             try:
                 chunk = resp.read1(65536) if hasattr(resp, "read1") else resp.read(65536)
             except socket.timeout:
-                continue
+                # after a timeout the socket refuses further reads, so this attempt is over; Devo pads
+                # running queries with whitespace, so silence this long means it has stalled
+                raise DevoError(f"no data from Devo for {read_timeout}s: the query was abandoned",
+                                "narrow --from/--to or filter earlier, use --chunk to split the range, "
+                                "or re-run if Devo was busy", code=3)
             except (http.client.IncompleteRead, ConnectionError, OSError) as e:
                 raise DevoError(f"connection dropped mid-response ({type(e).__name__})",
                                 "transient: re-run, or use --chunk to split the range")
             if not chunk:
                 break
-            for row in parser.feed(chunk.decode("utf-8", "replace")):
+            for row in parser.feed(decoder.decode(chunk)):
                 yield parser.columns, row
-        for row in parser.close():
+        for row in parser.feed(decoder.decode(b"", final=True)) + parser.close():
             yield parser.columns, row
     if parser.columns is None:
         raise DevoError("empty response from Devo (no metadata line)")
@@ -1241,6 +1272,8 @@ def to_ms(value):
 
 
 PAGE = 100
+MAX_ALERT_PAGES = 500  # hard stop for the alerts paging loop, whatever the API returns
+STALE_ALERT_PAGES = 3  # consecutive pages with no new ids: the API is repeating itself or ignoring offset
 RETRY_DELAY = 2  # seconds; chunk retries after a dropped connection
 
 
@@ -1249,25 +1282,39 @@ def fetch_alerts(cfg, frm, to, max_items):
     pages oldest first and often returns fewer items than `limit` even when more exist, so page
     until an empty page and de-duplicate by id. `showAll` is never sent: live, showAll=true
     *hides* Closed alerts (the docs say the opposite) and omitting it returns everything.
-    Returns (alerts, truncated)."""
-    seen, offset = {}, 0
-    while True:
+    A short page never ends it (more can follow). It also stops after STALE_ALERT_PAGES pages in a row
+    that add no new ids (the API ignored `offset` or repeated a page; one overlapping page can be normal)
+    and after MAX_ALERT_PAGES pages. Returns (alerts, truncated)."""
+    seen, offset, capped, stale = {}, 0, False, 0
+    for _ in range(MAX_ALERT_PAGES):
         q = {"limit": PAGE, "offset": offset, "from": frm, "to": to}
         page = get_json(alerts_url(cfg, "alerts/list?" + urllib.parse.urlencode(q)), cfg["token"])
         if not isinstance(page, list):
             raise DevoError(f"unexpected response: {str(page)[:200]}")
         if not page:
             break
+        before = len(seen)
         for x in page:
-            seen.setdefault(x.get("id"), x)
+            if isinstance(x, dict):
+                seen.setdefault(x.get("id"), x)
+        stale = stale + 1 if len(seen) == before else 0
+        if stale >= STALE_ALERT_PAGES:
+            break
         offset += PAGE
         if len(seen) >= max_items:
             break
+    else:
+        capped = True
+        print(f"# warning: stopped after {MAX_ALERT_PAGES} pages of alerts ({len(seen)} alerts): narrow --from/--to",
+              file=sys.stderr)
     items = sorted(seen.values(), key=lambda x: x.get("createDate") or 0, reverse=True)
-    return items, len(seen) >= max_items
+    return items, len(seen) >= max_items or capped
 
 
 def cmd_alerts(cfg, a):
+    for k in (a.group_by or "").split(","):  # key regexes: fail before fetching anything
+        if k.strip():
+            user_regex(GROUP_KEYS.get(k.strip(), k.strip()), "--group-by")
     frm, to = to_ms(a.from_), to_ms(a.to)
     items, truncated = fetch_alerts(cfg, frm, to, a.max)
     if a.open:
