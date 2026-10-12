@@ -202,6 +202,126 @@ ALERT = {"id": 1, "createDate": 1000, "status": 0, "priority": 5, "context": "my
          "alertDefinition": {"name": "Rule"}, "extraData": "{}"}
 
 
+class BadInputTests(unittest.TestCase):
+    """8. Bad input gives `ERROR:` and a hint, never a traceback."""
+
+    def assert_clean(self, argv, responses=()):
+        code, out, err, _ = run_cli(argv, list(responses))
+        self.assertEqual(code, 1, err)
+        self.assertIn("ERROR:", err)
+        self.assertNotIn("Traceback", err)
+        return err
+
+    def test_impossible_dates(self):
+        for v in ("2026-02-30", "2026-09-28T25:00", "2026-13-01"):
+            with self.subTest(v=v):
+                with self.assertRaises(devo.DevoError):
+                    devo.resolve_time(v, now=NOW)
+        self.assert_clean(["query", "from t.x select *", "--from", "2026-02-30"])
+
+    def test_bad_regexes(self):
+        self.assert_clean(["schema", "t.x", "--grep", "("])
+        self.assert_clean(["tables", "--grep", "("])
+        self.assert_clean(["boards", "--grep", "("])
+        self.assert_clean(["lag", "--tables", "("])
+
+    def test_non_integer_board_layout(self):
+        d = tempfile.mkdtemp()
+        spec = write(os.path.join(d, "spec.json"), json.dumps(
+            {"name": "N", "widgets": [{"type": "Table", "query": "from a select b", "w": "wide"}]}))
+        self.assert_clean(["board-new", spec, "--out", os.path.join(d, "b.json")])
+
+    def test_a_json_line_that_is_not_an_object(self):
+        with self.assertRaises(devo.DevoError):
+            devo.CompactStream().feed('[1, 2]\n')
+        with self.assertRaises(devo.DevoError):
+            devo.CompactStream().feed('"text"\n')
+
+    def test_unexpected_errors_are_one_line(self):
+        with mock.patch.object(devo, "cmd_check", side_effect=RuntimeError("boom")):
+            code, out, err, _ = run_cli(["check"], [])
+        self.assertEqual(code, 1)
+        self.assertIn("ERROR: RuntimeError: boom", err)
+        self.assertNotIn("Traceback", err)
+
+
+class RegexCostTests(unittest.TestCase):
+    """9. Profiling a crafted 64 KB value takes milliseconds, not seconds."""
+
+    def test_crafted_values_classify_fast(self):
+        n = 65536
+        for s in ('"a@' + "." * n + "x", '"a@' + "a." * (n // 2), "a@" + "a." * (n // 2) + " ",
+                  "a@" + "." * n + "@", "x" * n + "@" + "." * n):
+            start = time.time()
+            devo.classify(s)
+            self.assertLess(time.time() - start, 0.5, s[:20])
+
+    def test_emails_still_classify(self):
+        self.assertEqual(devo.classify("jsmith@example.com"), "email")
+        self.assertEqual(devo.classify('"jsmith@mail.example.co.uk"'), "email-quoted")
+        self.assertEqual(devo.classify("o'brien+tag@example.com"), "email")
+
+
+class LinqStringTests(unittest.TestCase):
+    """10. One quoting helper: escape backslash and double quote, keep UTF-8."""
+
+    def test_linq_str(self):
+        self.assertEqual(devo.linq_str('a"b\\c'), '"a\\"b\\\\c"')
+        self.assertEqual(devo.linq_str("José"), '"José"')
+
+    def test_teams_subject_condition_escapes_log_values(self):
+        cond = devo.teams_subject_cond({"aaaaaaaa-0000-0000-0000-000000000001"}, {'a"b@example.com'})
+        self.assertIn('weakhas(message, "a\\"b@example.com")', cond)
+        self.assertIn('message -> "aaaaaaaa-0000-0000-0000-000000000001"', cond)
+
+    def test_board_inputs_keep_utf8(self):
+        linq, missing = devo.board_fill_inputs("from t where u = $Input0.value", {"Input0": 'José "J"'})
+        self.assertEqual((linq, missing), ('from t where u = "José \\"J\\""', set()))
+
+    def test_linq_set_escapes(self):
+        self.assertEqual(devo.linq_set(['a"b', "c"]), '{"a\\"b", "c"}')
+
+    def test_no_json_dumps_quoting_left_in_linq(self):
+        with open(devo.__file__, encoding="utf-8") as f:
+            src = f.read()
+        self.assertNotIn('", ".join(json.dumps(', src)
+        self.assertNotIn("return json.dumps(v)\n\n    return BOARD_INPUT", src)
+
+
+class BatchParallelTests(unittest.TestCase):
+    """11. A job's `parallel` is clamped to the same maximum as `query --parallel`."""
+
+    def test_job_parallel_is_clamped(self):
+        d = tempfile.mkdtemp()
+        spec = write(os.path.join(d, "spec.json"), json.dumps(
+            [{"name": "j", "query": "from t.x select a", "from": "1h", "to": "now", "parallel": 500}]))
+        seen = []
+
+        def fake_fetch(cfg, linq, frm, to, limit, timeout, chunk=None, parallel=4, *a, **k):
+            seen.append(parallel)
+            return [("a", "str")], [["v"]], {"windows": 1, "retried": 0, "full": [], "splits": 0, "failed": []}
+
+        with mock.patch.object(devo, "fetch", fake_fetch):
+            code, out, err, _ = run_cli(["batch", spec, "--out-dir", os.path.join(d, "out")], [])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(seen, [devo.MAX_PARALLEL])
+        self.assertIn("parallel", err)
+
+    def test_query_parallel_is_clamped(self):
+        seen = []
+
+        def fake_fetch(cfg, linq, frm, to, limit, timeout, chunk=None, parallel=4, *a, **k):
+            seen.append(parallel)
+            return [("a", "str")], [["v"]], {"windows": 1, "retried": 0, "full": [], "splits": 0, "failed": []}
+
+        with mock.patch.object(devo, "fetch", fake_fetch):
+            code, out, err, _ = run_cli(["query", "from t.x select a", "--from", "2h", "--to", "1h", "--chunk", "1h",
+                                         "--parallel", "64"], [])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(seen, [devo.MAX_PARALLEL])
+        self.assertIn("parallel", err)
+
+
 class SummaryPathTests(unittest.TestCase):
     """12. File paths read back from summary.json resolve inside the activity directory only."""
 
@@ -234,6 +354,29 @@ class SummaryPathTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
             devo.print_activity(self.summary, 0, self.dir)
         self.assertNotIn("99999999", err.getvalue())
+
+
+class HelpAndTimeTests(unittest.TestCase):
+    """Also: --limit is documented as per window; ISO forms parse the same on every Python."""
+
+    def test_limit_help_says_per_window(self):
+        import argparse
+        p = devo.build_parser()
+        sub = next(a for a in p._actions if isinstance(a, argparse._SubParsersAction)).choices["query"]
+        limit = next(a for a in sub._actions if "--limit" in a.option_strings)
+        self.assertIn("per window", limit.help)
+        with open(os.path.join(devo.SKILL_DIR, "references", "commands.md"), encoding="utf-8") as f:
+            self.assertIn("per window", f.read())
+
+    def test_iso_forms(self):
+        r = lambda v: devo.resolve_time(v, now=NOW)[1]
+        base = r("2026-09-28T14:00:00Z")
+        self.assertEqual(r("2026-09-28T14:00:00.123456789Z"), base)
+        self.assertEqual(r("2026-09-28T14:00:00.5Z"), base)
+        self.assertEqual(r("2026-09-28T15:00:00+0100"), base)
+        self.assertEqual(r("2026-09-28+01:00"), r("2026-09-27T23:00Z"))
+        self.assertEqual(r("2026-09-28 14:00"), base)
+        self.assertEqual(devo.iso_utc(devo.parse_utc("2026-09-28T14:00:00.5Z")), "2026-09-28T14:00:00Z")
 
 
 if __name__ == "__main__":

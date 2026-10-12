@@ -77,6 +77,15 @@ def inside_skill(path):
         return False
 
 
+def user_regex(pattern, what="--grep"):
+    """Compile a regex the user passed (case-insensitive); DevoError instead of re.error."""
+    try:
+        return re.compile(pattern, re.I)
+    except re.error as e:
+        raise DevoError(f"{what} {pattern!r} is not a valid regular expression ({e})",
+                        "escape special characters such as ( [ * + ? with a backslash", code=1)
+
+
 class DevoError(Exception):
     def __init__(self, msg, hint="", code=2):
         super().__init__(msg)
@@ -180,7 +189,24 @@ def load_config(environ=None):
 
 DUR = re.compile(r"^\s*-?\s*(\d+)\s*(s|m|h|d|w)\s*(?:ago)?\s*$", re.I)
 UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
-ISO = re.compile(r"^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?\s*(Z|[+-]\d{2}:?\d{2})?$", re.I)
+ISO = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?)?\s*(Z|[+-]\d{2}:?\d{2})?$",
+                 re.I)
+
+
+def parse_iso(s):
+    """An aware datetime from the ISO forms ISO matches (UTC when no offset). Parsed by hand because
+    datetime.fromisoformat differs across versions: before 3.11 it rejects 9-digit fractions and
+    1-digit ones, and every version reads "2026-09-28+01:00" as 01:00 local. ValueError if invalid."""
+    m = ISO.match(s.strip())
+    if not m:
+        raise ValueError(f"not an ISO date/time: {s!r}")
+    y, mo, d, h, mi, sec, frac, off = m.groups()
+    tz = dt.timezone.utc
+    if off and off.upper() != "Z":
+        sign = -1 if off[0] == "-" else 1
+        tz = dt.timezone(sign * dt.timedelta(hours=int(off[1:3]), minutes=int(off[-2:])))
+    return dt.datetime(int(y), int(mo), int(d), int(h or 0), int(mi or 0), int(sec or 0),
+                       int((frac or "0")[:6].ljust(6, "0")), tzinfo=tz)
 
 
 def resolve_time(value, now=None):
@@ -206,13 +232,11 @@ def resolve_time(value, now=None):
         t = n // 1000 if n > 10 ** 11 else n  # treat 12+ digit values as milliseconds
         return t, t
     if ISO.match(s):
-        iso = s.replace(" ", "T", 1) if re.match(r"^\d{4}-\d{2}-\d{2} \d", s) else s
-        iso = re.sub(r"[zZ]$", "+00:00", iso)
-        iso = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", iso)
-        d = dt.datetime.fromisoformat(iso)
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=dt.timezone.utc)
-        t = int(d.timestamp())
+        try:
+            t = int(parse_iso(s).timestamp())
+        except (ValueError, OverflowError) as e:
+            raise DevoError(f"can't parse time {value!r}: {e}", "check the date and time are real (e.g. no "
+                            "30 February, hours 00-23)", code=1)
         return t, t
     raise DevoError(f"can't parse time {value!r}",
                     "use e.g. 24h, 7d, now, today, yesterday, 2026-09-28T14:00Z, epoch seconds, "
@@ -265,6 +289,8 @@ def parse_utc(v):
         s = str(v).strip()
         if not re.match(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}", s):
             return None
+        if ISO.match(s):
+            return parse_iso(s).astimezone(dt.timezone.utc)
         s = s.replace(" ", "T", 1)
         s = re.sub(r"(\.\d{1,6})\d*", r"\1", s)  # fromisoformat takes at most microseconds
         s = re.sub(r"[zZ]$", "+00:00", s)
@@ -447,6 +473,8 @@ class CompactStream:
             obj = json.loads(line)
         except ValueError:
             raise DevoError(f"unparseable response line: {line[:200]}")
+        if not isinstance(obj, dict):
+            raise DevoError(f"unexpected response line (not an object): {line[:200]}")
         if "d" in obj:
             yield obj["d"]
         elif "metadata" in obj or "m" in obj:
@@ -590,6 +618,7 @@ def chunk_step(chunk):
     return step
 
 
+MAX_PARALLEL = 8  # concurrent windows per query (`query --parallel`, a batch job's `parallel`)
 MIN_SPLIT = 300  # seconds: --auto-split stops halving a window below this
 MAX_SPLITS = 64  # halvings per fetch(), so a filter that matches everything can't fan out without end
 AUTO_SPLIT_MIN_LIMIT = 1000  # below this a --limit is a sample, not a collection: don't split by default
@@ -933,6 +962,11 @@ def unknown_fields(linq, cfg=None):
 SAFE_TERM = re.compile(r"^[A-Za-z0-9_.@$-]+$")
 
 
+def linq_str(v):
+    """A double-quoted LINQ string literal: backslash and double quote escaped, UTF-8 kept as is."""
+    return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def linq_term(term, what="term"):
     """A user-supplied name/term, validated for safe use inside a LINQ string literal."""
     if not SAFE_TERM.match(term or ""):
@@ -948,7 +982,7 @@ def feed_gaps(cfg, tables, frm_s, to_s, timeout=300, slack=6 * 3600):
     if not tables or to_s - frm_s < 12 * 3600:
         return {}
     q = ('from siem.logtrust.collector.counter where kind = "table", object in {'
-         + ", ".join(json.dumps(t) for t in tables[:200]) + '} group by object select max(eventdate) as last')
+         + ", ".join(linq_str(t) for t in tables[:200]) + '} group by object select max(eventdate) as last')
     try:
         cols, rws, _ = fetch(cfg, q, frm_s, to_s, 0, timeout, "1d", 4)
     except DevoError:
@@ -959,6 +993,9 @@ def feed_gaps(cfg, tables, frm_s, to_s, timeout=300, slack=6 * 3600):
 
 
 def cmd_query(cfg, a):
+    if a.parallel > MAX_PARALLEL:
+        print(f"# warning: --parallel {a.parallel} clamped to {MAX_PARALLEL}", file=sys.stderr)
+        a.parallel = MAX_PARALLEL
     linq = a.linq if a.linq != "-" else sys.stdin.read()
     linq = re.sub(r"^(\s*from\s+)(\S+)", lambda m: m.group(1) + quote_table(m.group(2)), linq, count=1)
     frm, frm_s = resolve_time(a.from_)
@@ -1075,10 +1112,10 @@ def table_fields(cfg, table):
 
 
 def cmd_schema(cfg, a):
+    rx = user_regex(a.grep) if a.grep else None
     fields, how = table_fields(cfg, a.table)
     total = len(fields)
-    if a.grep:
-        rx = re.compile(a.grep, re.I)
+    if rx:
         fields = [(f, t) for f, t in fields if rx.search(f)]
     if a.format == "json":
         print(json.dumps([{"field": f, "type": t} for f, t in fields], indent=1))
@@ -1091,7 +1128,7 @@ def cmd_schema(cfg, a):
 
 
 def cmd_tables(cfg, a):
-    pat = re.compile(a.grep, re.I) if a.grep else None
+    pat = user_regex(a.grep) if a.grep else None
     if a.live and a.from_ != TABLES_WINDOW:  # a one-off window: shown, not cached
         rows = [tuple(r) for r in live_tables(cfg, a.from_, a.timeout)]
         src = f"live, events since {a.from_}"
@@ -1695,7 +1732,7 @@ def board_fill_inputs(linq, values):
         v = values[name]
         if raw or re.fullmatch(r"-?\d+(\.\d+)?", v):
             return v
-        return json.dumps(v)
+        return linq_str(v)
 
     return BOARD_INPUT.sub(sub, linq), missing
 
@@ -1711,9 +1748,9 @@ def board_summary_line(b):
 
 def cmd_boards(cfg, a):
     """List the domain's Activeboards (Devo's dashboards) visible to the token's user."""
+    rx = user_regex(a.grep) if a.grep else None
     items = board_call(cfg, "GET", "activeboards") or []
-    if a.grep:
-        rx = re.compile(a.grep, re.I)
+    if rx:
         items = [b for b in items if rx.search(" ".join(str(b.get(k) or "") for k in ("name", "description"))
                                                + " " + " ".join(b.get("tags") or []))]
     items.sort(key=lambda b: b.get("updateDate") or 0, reverse=True)
@@ -1881,9 +1918,13 @@ def cmd_board_new(cfg, a):
                 "extra": {"lastMetadata": []}, "children": None, "version": 3}
         if node["date"]:
             node["date"]["realTime"] = False
-        wd, hd = int(w.get("w", 6)), int(w.get("h", 2 if kind == "input" else 10))
-        if "x" in w or "y" in w:
-            cx, cy = int(w.get("x", 0)), int(w.get("y", 0))
+        try:
+            wd, hd = int(w.get("w", 6)), int(w.get("h", 2 if kind == "input" else 10))
+            xy = (int(w.get("x", 0)), int(w.get("y", 0))) if "x" in w or "y" in w else None
+        except (TypeError, ValueError):
+            raise DevoError(f"widget {key}: w, h, x and y must be whole numbers", code=1)
+        if xy:
+            cx, cy = xy
         else:
             if x + wd > BOARD_COLS:
                 x, y, row_h = 0, y + row_h, 0
@@ -2684,8 +2725,8 @@ def _read_jsonl(path):
 PATTERNS = [  # (name, regex) - first match wins; applied to str(value).strip()
     ("guid-quoted", re.compile(r'^"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"$')),
     ("guid", re.compile(r"^\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}?$")),
-    ("email-quoted", re.compile(r'^"[^@\s"]+@[^@\s"]+\.[^@\s"]+"$')),
-    ("email", re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")),
+    ("email-quoted", re.compile(r'^"[^@\s"]+@[^@\s".]+(?:\.[^@\s".]+)+"$')),  # labels split at dots: linear
+    ("email", re.compile(r"^[^@\s]+@[^@\s.]+(?:\.[^@\s.]+)+$")),
     ("domain\\user", re.compile(r"^[A-Za-z0-9_.-]+\\[^\\\s]+$")),
     ("sid", re.compile(r"^S-1-\d+(-\d+)+$")),
     ("ipv4", re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")),
@@ -2896,7 +2937,7 @@ def compact_profile(prof):
 def print_profile(table, prof, show_empty=False, grep=None):
     fields, empty = prof["fields"], prof.get("empty", [])
     if grep:
-        rx = re.compile(grep, re.I)
+        rx = user_regex(grep)
         fields = {k: v for k, v in fields.items() if rx.search(k)}
         empty = [k for k in empty if rx.search(k)]
     print(f"\n{table}  ({prof['rows']} sample rows from the last {prof['window']}"
@@ -2975,7 +3016,7 @@ def cmd_fields(cfg, a):
             print_profile(t, prof, a.all, a.grep)
         return 0
     a.role = a.role or "ip"
-    rx = re.compile(a.grep, re.I) if a.grep else None
+    rx = user_regex(a.grep) if a.grep else None
     count = 0
     for t, prof in tables.items():
         if rx and not rx.search(t):
@@ -3140,6 +3181,7 @@ def offset_note(r):
 def cmd_lag(cfg, a):
     """Ingestion lag per table, measured now: eventdate − event time, per hour of ingestion."""
     from concurrent.futures import ThreadPoolExecutor
+    tables_rx = user_regex(a.tables, "--tables") if a.tables else None
     _, frm_s = resolve_time(a.from_)
     _, to_s = resolve_time(a.to)
     if to_s is not None:
@@ -3152,7 +3194,7 @@ def cmd_lag(cfg, a):
     if have is not None:
         tables = [t for t in tables if t in have]
     if a.tables:
-        rx = re.compile(a.tables, re.I)
+        rx = tables_rx
         extra = [t for t in sorted(have or []) if rx.search(t) and t not in tables
                  and (event_time_for(t, fams) or profile_time_family(t))]
         skipped = [t for t in sorted(have or []) if rx.search(t) and t not in tables and t not in extra]
@@ -3405,6 +3447,9 @@ def cmd_batch(cfg, a):
         for k in ("limit", "parallel", "timeout"):
             if k in j and (not isinstance(j[k], int) or isinstance(j[k], bool) or j[k] < 0):
                 raise DevoError(f"job {j['name']}: {k} must be a whole number (JSON number, not a string)", code=1)
+        if j.get("parallel", 0) > MAX_PARALLEL:
+            print(f"# warning: job {j['name']}: parallel {j['parallel']} clamped to {MAX_PARALLEL}", file=sys.stderr)
+            j["parallel"] = MAX_PARALLEL
         for k in ("query", "from", "to", "chunk", "min_split"):
             if k in j and not isinstance(j[k], str):
                 raise DevoError(f"job {j['name']}: {k} must be a string", code=1)
@@ -3740,7 +3785,13 @@ TEAMS_SLACK = 86400  # meeting records are created hours after the meeting: sear
 
 
 def linq_set(values):
-    return "{" + ", ".join(f'"{v}"' for v in sorted(values)) + "}"
+    return "{" + ", ".join(linq_str(v) for v in sorted(values)) + "}"
+
+
+def teams_subject_cond(oids, upns):
+    """The subject filter for `teams`: object ids and UPNs (taken from log data, so quoted with linq_str)."""
+    return " or ".join([f"message -> {linq_str(o)}" for o in sorted(oids)]
+                       + [f"weakhas(message, {linq_str(u)})" for u in sorted(upns)])
 
 
 def teams_select(where, extra=""):
@@ -4035,7 +4086,7 @@ def cmd_teams(cfg, a):
                             code=1)
         oids = {o for _, o, _ in accounts}
         upns = {u for u, _, _ in accounts}
-        cond = " or ".join([f'message -> "{o}"' for o in sorted(oids)] + [f'weakhas(message, "{u}")' for u in sorted(upns)])
+        cond = teams_subject_cond(oids, upns)
         linq = teams_select(f"({cond})")
         queries.append(linq)
         base, info = teams_pull(cfg, linq, frm_s, ing_to, a.timeout)
@@ -5249,7 +5300,7 @@ def creds_stage2(a):
               f"{r.get('properties_status_errorCode')}  {r.get('properties_appDisplayName') or ''}  "
               f"{(r.get('properties_userAgent') or '')[:40]}")
     if others and not stage3_ran:
-        q = ", ".join(json.dumps(u) for u in sorted(others)[:200])
+        q = ", ".join(linq_str(u) for u in sorted(others)[:200])
         out = os.path.join(s2, "stage3.jsonl")
         with open(out, "w", encoding="utf-8") as f:
             f.write(json.dumps({"name": "other_users_baseline", "from": "30d", "to": "now", "chunk": "1d", "parallel": 6,
@@ -5474,7 +5525,7 @@ def cmd_creds(cfg, a):
     ips = [x for x in dict.fromkeys(ips) if x not in egress][: a.max_ips]
     users = [u for u, _ in brute][:200] + [u for ip, e in spray for u in e["users"]][:200]
     users = list(dict.fromkeys(u for u in users if u))[:300]
-    q = lambda vals: ", ".join(json.dumps(v) for v in vals)
+    q = lambda vals: ", ".join(linq_str(v) for v in vals)
     jobs = []
     if ips:
         for t in ("cloud.azure.ad.signin", "cloud.azure.ad.noninteractive_user_signin"):
@@ -6713,7 +6764,8 @@ def build_parser():
     s.add_argument("linq")
     s.add_argument("--from", dest="from_", default="1h", help="start (default 1h = one hour ago)")
     s.add_argument("--to", default="now", help="end (default now)")
-    s.add_argument("--limit", type=int, default=200, help="max rows (default 200; 0 = no limit, careful)")
+    s.add_argument("--limit", type=int, default=200, help="max rows per window (default 200; 0 = no limit, careful). With --chunk or "
+                   "auto-split each window has its own limit, so the total can be many times it")
     s.add_argument("--format", choices=fmts, default="table")
     s.add_argument("--sort", help="client-side sort of the returned rows: --sort=field or --sort=-field (desc), "
                                   "comma-separated (LINQ has no ORDER BY)")
@@ -7134,6 +7186,9 @@ def main(argv=None):
         return 130
     except BrokenPipeError:
         return 0
+    except Exception as e:  # a bug or input nothing above anticipated: one line, not a traceback
+        print(f"ERROR: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
 
 
 def utf8_stdio():
