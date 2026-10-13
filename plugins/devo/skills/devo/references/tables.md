@@ -170,6 +170,9 @@ covered here.
 
 ## 8. Union table reference
 
+Source: Devo's union table documentation ([docs.devo.com](https://docs.devo.com)); Devo's terms
+apply (see THIRD_PARTY.md in the repository).
+
 Per table: purpose; source tables (count and names; abbreviated for per-log-type unions); normalised fields as `name:type`,
 deduplicated across all sources; fields beyond the 45th are summarised. Types: `str`, `ip4`, `ip6`,
 `int4`, `int8`, `float8`, `bool`, `timestamp`, `json`. A slash (`str/ip4`) means sources disagree.
