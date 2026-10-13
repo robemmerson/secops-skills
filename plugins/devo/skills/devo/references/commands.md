@@ -41,7 +41,9 @@ directory>/scripts/devo.py`). Read this before long, chunked, sorted or batched 
   per chunk: `query` and `batch` **merge them automatically** when the aggregations are count, sum,
   min, max or hllppcount (the stderr note says so; hllppcount becomes the largest per-window value, a
   lower bound, and a `where` on aggregates ran per window; `--no-merge` keeps the per-window rows).
-  Anything else (avg, collect…) is left unmerged with a warning. `--limit` applies per chunk. **Auto-split**: when a chunk returns exactly
+  Anything else (avg, collect…) is left unmerged with a warning. **`--limit` applies per window,
+  not in total**: each chunk and each auto-split half has its own limit, so a chunked or split query can
+  return many times `--limit` rows (`batch` and `activity` work the same way). **Auto-split**: when a chunk returns exactly
   `--limit` rows, the helper halves it and re-runs both halves (down to `--min-split`, 5 min). It is
   on by default for raw-row queries with `--limit` ≥ 1000 (off for samples and `group` queries;
   `--auto-split`/`--no-auto-split` override). A back-fill can land more rows than the limit in one

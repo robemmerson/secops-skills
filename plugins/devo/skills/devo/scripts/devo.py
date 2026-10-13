@@ -49,7 +49,7 @@ expressions containing now() (e.g. "now() - 3h", "(now() - 1d) @ 1d"), passed th
 
 Exit codes: 0 ok, 1 usage/config error, 2 API error, 3 timeout.
 """
-import argparse, codecs, csv, datetime as dt, http.client, io, json, os, re, socket, stat, sys, threading, time
+import argparse, codecs, contextlib, csv, datetime as dt, http.client, io, json, os, re, socket, stat, sys, threading, time
 import urllib.error, urllib.parse, urllib.request
 
 VERSION = "1.0"
@@ -75,6 +75,15 @@ def inside_skill(path):
         return os.path.commonpath([os.path.abspath(path), SKILL_DIR]) == SKILL_DIR
     except ValueError:
         return False
+
+
+def user_regex(pattern, what="--grep"):
+    """Compile a regex the user passed (case-insensitive); DevoError instead of re.error."""
+    try:
+        return re.compile(pattern, re.I)
+    except re.error as e:
+        raise DevoError(f"{what} {pattern!r} is not a valid regular expression ({e})",
+                        "escape special characters such as ( [ * + ? with a backslash", code=1)
 
 
 class DevoError(Exception):
@@ -180,7 +189,24 @@ def load_config(environ=None):
 
 DUR = re.compile(r"^\s*-?\s*(\d+)\s*(s|m|h|d|w)\s*(?:ago)?\s*$", re.I)
 UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
-ISO = re.compile(r"^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?\s*(Z|[+-]\d{2}:?\d{2})?$", re.I)
+ISO = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?)?\s*(Z|[+-]\d{2}:?\d{2})?$",
+                 re.I)
+
+
+def parse_iso(s):
+    """An aware datetime from the ISO forms ISO matches (UTC when no offset). Parsed by hand because
+    datetime.fromisoformat differs across versions: before 3.11 it rejects 9-digit fractions and
+    1-digit ones, and every version reads "2026-09-28+01:00" as 01:00 local. ValueError if invalid."""
+    m = ISO.match(s.strip())
+    if not m:
+        raise ValueError(f"not an ISO date/time: {s!r}")
+    y, mo, d, h, mi, sec, frac, off = m.groups()
+    tz = dt.timezone.utc
+    if off and off.upper() != "Z":
+        sign = -1 if off[0] == "-" else 1
+        tz = dt.timezone(sign * dt.timedelta(hours=int(off[1:3]), minutes=int(off[-2:])))
+    return dt.datetime(int(y), int(mo), int(d), int(h or 0), int(mi or 0), int(sec or 0),
+                       int((frac or "0")[:6].ljust(6, "0")), tzinfo=tz)
 
 
 def resolve_time(value, now=None):
@@ -206,13 +232,11 @@ def resolve_time(value, now=None):
         t = n // 1000 if n > 10 ** 11 else n  # treat 12+ digit values as milliseconds
         return t, t
     if ISO.match(s):
-        iso = s.replace(" ", "T", 1) if re.match(r"^\d{4}-\d{2}-\d{2} \d", s) else s
-        iso = re.sub(r"[zZ]$", "+00:00", iso)
-        iso = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", iso)
-        d = dt.datetime.fromisoformat(iso)
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=dt.timezone.utc)
-        t = int(d.timestamp())
+        try:
+            t = int(parse_iso(s).timestamp())
+        except (ValueError, OverflowError) as e:
+            raise DevoError(f"can't parse time {value!r}: {e}", "check the date and time are real (e.g. no "
+                            "30 February, hours 00-23)", code=1)
         return t, t
     raise DevoError(f"can't parse time {value!r}",
                     "use e.g. 24h, 7d, now, today, yesterday, 2026-09-28T14:00Z, epoch seconds, "
@@ -265,6 +289,8 @@ def parse_utc(v):
         s = str(v).strip()
         if not re.match(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}", s):
             return None
+        if ISO.match(s):
+            return parse_iso(s).astimezone(dt.timezone.utc)
         s = s.replace(" ", "T", 1)
         s = re.sub(r"(\.\d{1,6})\d*", r"\1", s)  # fromisoformat takes at most microseconds
         s = re.sub(r"[zZ]$", "+00:00", s)
@@ -316,6 +342,31 @@ def add_local_fields(rec, tz, fields=("eventdate", "first", "last", "first_event
 
 # ---------------------------------------------------------------- HTTP
 
+DEVO_HOST = re.compile(r"(^|\.)devo\.com$")
+
+
+class SafeRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only to https://*.devo.com, and drop the token headers when the host changes:
+    urllib's default handler copies Authorization and standAloneToken to wherever a redirect points."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is None:
+            return None
+        u = urllib.parse.urlsplit(new.full_url)
+        host = (u.hostname or "").lower()
+        if u.scheme != "https" or not DEVO_HOST.search(host):
+            raise DevoError(f"refused a redirect to {u.scheme}://{host}: the token is only sent to https://*.devo.com",
+                            "check the region (`devo.py check`) and any proxy in between")
+        if host != (urllib.parse.urlsplit(req.full_url).hostname or "").lower():
+            for h in ("Authorization", "Standalonetoken"):
+                new.remove_header(h)
+        return new
+
+
+OPENER = urllib.request.build_opener(SafeRedirect)
+
+
 def http_open(method, url, token, body=None, headers=None, timeout=60):
     """Open a request; return the response object or raise DevoError with a readable message."""
     h = {"User-Agent": USER_AGENT, "Accept": "application/json", "Authorization": f"Bearer {token}"}
@@ -325,7 +376,7 @@ def http_open(method, url, token, body=None, headers=None, timeout=60):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, headers=h, method=method)
     try:
-        return urllib.request.urlopen(req, timeout=timeout)
+        return OPENER.open(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         raise api_error(e.code, e.read().decode("utf-8", "replace"), token)
     except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
@@ -447,6 +498,8 @@ class CompactStream:
             obj = json.loads(line)
         except ValueError:
             raise DevoError(f"unparseable response line: {line[:200]}")
+        if not isinstance(obj, dict):
+            raise DevoError(f"unexpected response line (not an object): {line[:200]}")
         if "d" in obj:
             yield obj["d"]
         elif "metadata" in obj or "m" in obj:
@@ -470,7 +523,9 @@ def run_query(cfg, linq, frm, to, limit, timeout, ip_as_string=True):
     url = f"https://{REGIONS[cfg['region']][0]}/search/query"
     deadline = time.time() + timeout
     parser = CompactStream()
-    resp = http_open("POST", url, cfg["token"], body=body, timeout=min(timeout, 120))
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")  # a character can span two reads
+    read_timeout = min(timeout, 120)
+    resp = http_open("POST", url, cfg["token"], body=body, timeout=read_timeout)
     with resp:
         while True:
             if time.time() > deadline:
@@ -480,15 +535,19 @@ def run_query(cfg, linq, frm, to, limit, timeout, ip_as_string=True):
             try:
                 chunk = resp.read1(65536) if hasattr(resp, "read1") else resp.read(65536)
             except socket.timeout:
-                continue
+                # after a timeout the socket refuses further reads, so this attempt is over; Devo pads
+                # running queries with whitespace, so silence this long means it has stalled
+                raise DevoError(f"no data from Devo for {read_timeout}s: the query was abandoned",
+                                "narrow --from/--to or filter earlier, use --chunk to split the range, "
+                                "or re-run if Devo was busy", code=3)
             except (http.client.IncompleteRead, ConnectionError, OSError) as e:
                 raise DevoError(f"connection dropped mid-response ({type(e).__name__})",
                                 "transient: re-run, or use --chunk to split the range")
             if not chunk:
                 break
-            for row in parser.feed(chunk.decode("utf-8", "replace")):
+            for row in parser.feed(decoder.decode(chunk)):
                 yield parser.columns, row
-        for row in parser.close():
+        for row in parser.feed(decoder.decode(b"", final=True)) + parser.close():
             yield parser.columns, row
     if parser.columns is None:
         raise DevoError("empty response from Devo (no metadata line)")
@@ -590,6 +649,7 @@ def chunk_step(chunk):
     return step
 
 
+MAX_PARALLEL = 8  # concurrent windows per batch job (`parallel` in a spec, which can come from an MCP client)
 MIN_SPLIT = 300  # seconds: --auto-split stops halving a window below this
 MAX_SPLITS = 64  # halvings per fetch(), so a filter that matches everything can't fan out without end
 AUTO_SPLIT_MIN_LIMIT = 1000  # below this a --limit is a sample, not a collection: don't split by default
@@ -933,6 +993,11 @@ def unknown_fields(linq, cfg=None):
 SAFE_TERM = re.compile(r"^[A-Za-z0-9_.@$-]+$")
 
 
+def linq_str(v):
+    """A double-quoted LINQ string literal: backslash and double quote escaped, UTF-8 kept as is."""
+    return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def linq_term(term, what="term"):
     """A user-supplied name/term, validated for safe use inside a LINQ string literal."""
     if not SAFE_TERM.match(term or ""):
@@ -948,7 +1013,7 @@ def feed_gaps(cfg, tables, frm_s, to_s, timeout=300, slack=6 * 3600):
     if not tables or to_s - frm_s < 12 * 3600:
         return {}
     q = ('from siem.logtrust.collector.counter where kind = "table", object in {'
-         + ", ".join(json.dumps(t) for t in tables[:200]) + '} group by object select max(eventdate) as last')
+         + ", ".join(linq_str(t) for t in tables[:200]) + '} group by object select max(eventdate) as last')
     try:
         cols, rws, _ = fetch(cfg, q, frm_s, to_s, 0, timeout, "1d", 4)
     except DevoError:
@@ -1075,10 +1140,10 @@ def table_fields(cfg, table):
 
 
 def cmd_schema(cfg, a):
+    rx = user_regex(a.grep) if a.grep else None
     fields, how = table_fields(cfg, a.table)
     total = len(fields)
-    if a.grep:
-        rx = re.compile(a.grep, re.I)
+    if rx:
         fields = [(f, t) for f, t in fields if rx.search(f)]
     if a.format == "json":
         print(json.dumps([{"field": f, "type": t} for f, t in fields], indent=1))
@@ -1091,7 +1156,7 @@ def cmd_schema(cfg, a):
 
 
 def cmd_tables(cfg, a):
-    pat = re.compile(a.grep, re.I) if a.grep else None
+    pat = user_regex(a.grep) if a.grep else None
     if a.live and a.from_ != TABLES_WINDOW:  # a one-off window: shown, not cached
         rows = [tuple(r) for r in live_tables(cfg, a.from_, a.timeout)]
         src = f"live, events since {a.from_}"
@@ -1204,6 +1269,8 @@ def to_ms(value):
 
 
 PAGE = 100
+MAX_ALERT_PAGES = 500  # hard stop for the alerts paging loop, whatever the API returns
+STALE_ALERT_PAGES = 3  # consecutive pages with no new ids: the API is repeating itself or ignoring offset
 RETRY_DELAY = 2  # seconds; chunk retries after a dropped connection
 
 
@@ -1212,25 +1279,39 @@ def fetch_alerts(cfg, frm, to, max_items):
     pages oldest first and often returns fewer items than `limit` even when more exist, so page
     until an empty page and de-duplicate by id. `showAll` is never sent: live, showAll=true
     *hides* Closed alerts (the docs say the opposite) and omitting it returns everything.
-    Returns (alerts, truncated)."""
-    seen, offset = {}, 0
-    while True:
+    A short page never ends it (more can follow). It also stops after STALE_ALERT_PAGES pages in a row
+    that add no new ids (the API ignored `offset` or repeated a page; one overlapping page can be normal)
+    and after MAX_ALERT_PAGES pages. Returns (alerts, truncated)."""
+    seen, offset, capped, stale = {}, 0, False, 0
+    for _ in range(MAX_ALERT_PAGES):
         q = {"limit": PAGE, "offset": offset, "from": frm, "to": to}
         page = get_json(alerts_url(cfg, "alerts/list?" + urllib.parse.urlencode(q)), cfg["token"])
         if not isinstance(page, list):
             raise DevoError(f"unexpected response: {str(page)[:200]}")
         if not page:
             break
+        before = len(seen)
         for x in page:
-            seen.setdefault(x.get("id"), x)
+            if isinstance(x, dict):
+                seen.setdefault(x.get("id"), x)
+        stale = stale + 1 if len(seen) == before else 0
+        if stale >= STALE_ALERT_PAGES:
+            break
         offset += PAGE
         if len(seen) >= max_items:
             break
+    else:
+        capped = True
+        print(f"# warning: stopped after {MAX_ALERT_PAGES} pages of alerts ({len(seen)} alerts): narrow --from/--to",
+              file=sys.stderr)
     items = sorted(seen.values(), key=lambda x: x.get("createDate") or 0, reverse=True)
-    return items, len(seen) >= max_items
+    return items, len(seen) >= max_items or capped
 
 
 def cmd_alerts(cfg, a):
+    for k in (a.group_by or "").split(","):  # key regexes: fail before fetching anything
+        if k.strip():
+            user_regex(GROUP_KEYS.get(k.strip(), k.strip()), "--group-by")
     frm, to = to_ms(a.from_), to_ms(a.to)
     items, truncated = fetch_alerts(cfg, frm, to, a.max)
     if a.open:
@@ -1695,7 +1776,7 @@ def board_fill_inputs(linq, values):
         v = values[name]
         if raw or re.fullmatch(r"-?\d+(\.\d+)?", v):
             return v
-        return json.dumps(v)
+        return linq_str(v)
 
     return BOARD_INPUT.sub(sub, linq), missing
 
@@ -1711,9 +1792,9 @@ def board_summary_line(b):
 
 def cmd_boards(cfg, a):
     """List the domain's Activeboards (Devo's dashboards) visible to the token's user."""
+    rx = user_regex(a.grep) if a.grep else None
     items = board_call(cfg, "GET", "activeboards") or []
-    if a.grep:
-        rx = re.compile(a.grep, re.I)
+    if rx:
         items = [b for b in items if rx.search(" ".join(str(b.get(k) or "") for k in ("name", "description"))
                                                + " " + " ".join(b.get("tags") or []))]
     items.sort(key=lambda b: b.get("updateDate") or 0, reverse=True)
@@ -1881,9 +1962,13 @@ def cmd_board_new(cfg, a):
                 "extra": {"lastMetadata": []}, "children": None, "version": 3}
         if node["date"]:
             node["date"]["realTime"] = False
-        wd, hd = int(w.get("w", 6)), int(w.get("h", 2 if kind == "input" else 10))
-        if "x" in w or "y" in w:
-            cx, cy = int(w.get("x", 0)), int(w.get("y", 0))
+        try:
+            wd, hd = int(w.get("w", 6)), int(w.get("h", 2 if kind == "input" else 10))
+            xy = (int(w.get("x", 0)), int(w.get("y", 0))) if "x" in w or "y" in w else None
+        except (TypeError, ValueError):
+            raise DevoError(f"widget {key}: w, h, x and y must be whole numbers", code=1)
+        if xy:
+            cx, cy = xy
         else:
             if x + wd > BOARD_COLS:
                 x, y, row_h = 0, y + row_h, 0
@@ -2586,7 +2671,7 @@ def cmd_activity(cfg, a):
                "seconds": round(time.time() - start), "sources": results, "feed_gaps": feed_gaps}
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=1, ensure_ascii=False)
-    print_activity(summary, a.width)
+    print_activity(summary, a.width, out_dir)
     return 0
 
 
@@ -2607,7 +2692,7 @@ def mark_duplicates(results):
             seen[k] = r["source"]
 
 
-def print_activity(summary, width):
+def print_activity(summary, width, out_dir):
     res = summary["sources"]
     multi = len(summary.get("terms") or []) > 1
     rows = []
@@ -2657,12 +2742,21 @@ def print_activity(summary, width):
     print(f"# errors ({len(errors)}): {', '.join(errors) or '-'}   limit reached: {', '.join(limited) or '-'}",
           file=sys.stderr)
     oids = sorted({r.get("properties_userId") for x in res if x["source"].startswith("entra_") and x.get("file")
-                   for r in _read_jsonl(x["file"]) if r.get("properties_userId")})
+                   for r in _read_jsonl(inside_dir(out_dir, x["file"])) if r.get("properties_userId")})
     if oids and not any(x["source"].startswith("graph_") for x in res):
         print(f"# Graph second pass: --graph-ids {','.join(oids)} (object ids seen in the sign-ins)", file=sys.stderr)
 
 
+def inside_dir(d, path):
+    """d joined with only the last component of a path read back from summary.json (None if there is none),
+    so a summary that names a file elsewhere can't make us read it."""
+    name = re.split(r"[\\/]", str(path or ""))[-1]
+    return os.path.join(d, name) if name not in ("", ".", "..") else None
+
+
 def _read_jsonl(path):
+    if not path:
+        return []
     try:
         with open(path, encoding="utf-8") as f:
             return [json.loads(line) for line in f if line.strip()]
@@ -2675,8 +2769,8 @@ def _read_jsonl(path):
 PATTERNS = [  # (name, regex) - first match wins; applied to str(value).strip()
     ("guid-quoted", re.compile(r'^"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"$')),
     ("guid", re.compile(r"^\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}?$")),
-    ("email-quoted", re.compile(r'^"[^@\s"]+@[^@\s"]+\.[^@\s"]+"$')),
-    ("email", re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")),
+    ("email-quoted", re.compile(r'^"[^@\s"]+@[^@\s".]+(?:\.[^@\s".]+)+"$')),  # labels split at dots: linear
+    ("email", re.compile(r"^[^@\s]+@[^@\s.]+(?:\.[^@\s.]+)+$")),
     ("domain\\user", re.compile(r"^[A-Za-z0-9_.-]+\\[^\\\s]+$")),
     ("sid", re.compile(r"^S-1-\d+(-\d+)+$")),
     ("ipv4", re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")),
@@ -2887,7 +2981,7 @@ def compact_profile(prof):
 def print_profile(table, prof, show_empty=False, grep=None):
     fields, empty = prof["fields"], prof.get("empty", [])
     if grep:
-        rx = re.compile(grep, re.I)
+        rx = user_regex(grep)
         fields = {k: v for k, v in fields.items() if rx.search(k)}
         empty = [k for k in empty if rx.search(k)]
     print(f"\n{table}  ({prof['rows']} sample rows from the last {prof['window']}"
@@ -2966,7 +3060,7 @@ def cmd_fields(cfg, a):
             print_profile(t, prof, a.all, a.grep)
         return 0
     a.role = a.role or "ip"
-    rx = re.compile(a.grep, re.I) if a.grep else None
+    rx = user_regex(a.grep) if a.grep else None
     count = 0
     for t, prof in tables.items():
         if rx and not rx.search(t):
@@ -3131,6 +3225,7 @@ def offset_note(r):
 def cmd_lag(cfg, a):
     """Ingestion lag per table, measured now: eventdate − event time, per hour of ingestion."""
     from concurrent.futures import ThreadPoolExecutor
+    tables_rx = user_regex(a.tables, "--tables") if a.tables else None
     _, frm_s = resolve_time(a.from_)
     _, to_s = resolve_time(a.to)
     if to_s is not None:
@@ -3143,7 +3238,7 @@ def cmd_lag(cfg, a):
     if have is not None:
         tables = [t for t in tables if t in have]
     if a.tables:
-        rx = re.compile(a.tables, re.I)
+        rx = tables_rx
         extra = [t for t in sorted(have or []) if rx.search(t) and t not in tables
                  and (event_time_for(t, fams) or profile_time_family(t))]
         skipped = [t for t in sorted(have or []) if rx.search(t) and t not in tables and t not in extra]
@@ -3225,6 +3320,28 @@ SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 EXT = {"jsonl": "jsonl", "json": "json", "csv": "csv", "tsv": "tsv", "table": "txt"}
 
 
+def spec_query_file(base, rel, name=None):
+    """The real path of a job's query_file: a relative .linq path that stays under the spec's folder
+    (no absolute path, ~ or .., and no symlink out), because its text is copied into <name>.log."""
+    what = f"job {name}: query_file {rel!r}"
+    if not isinstance(rel, str) or not rel.strip():
+        raise DevoError(f"{what}: must be a file name", code=1)
+    parts = re.split(r"[\\/]", rel)
+    if (os.path.isabs(rel) or rel[:1] in ("/", "\\", "~") or re.match(r"^[A-Za-z]:", rel) or ".." in parts
+            or not rel.lower().endswith(".linq")):
+        raise DevoError(f"{what}: use a relative path to a .linq file in the spec's folder (no /, ~ or ..)",
+                        code=1)
+    root = os.path.realpath(base)
+    real = os.path.realpath(os.path.join(root, *parts))
+    try:
+        inside = os.path.commonpath([root, real]) == root
+    except ValueError:  # Windows: another drive
+        inside = False
+    if not inside or not real.lower().endswith(".linq"):
+        raise DevoError(f"{what}: resolves outside the spec's folder", code=1)
+    return real
+
+
 def load_spec(path):
     """Jobs from a JSON list, {"jobs": [...]}, or JSON Lines."""
     if path == "-":
@@ -3245,7 +3362,7 @@ def load_spec(path):
     base = os.path.dirname(os.path.abspath(path)) if path != "-" else os.getcwd()
     for j in jobs:  # "query_file": a .linq file next to the spec, so LINQ quotes need no JSON escaping
         if "query_file" in j and "query" not in j:
-            qp = os.path.join(base, os.path.expanduser(j["query_file"]))
+            qp = spec_query_file(base, j["query_file"], j.get("name"))
             try:
                 with open(qp, encoding="utf-8-sig") as f:
                     j["query"] = f.read()
@@ -3374,6 +3491,9 @@ def cmd_batch(cfg, a):
         for k in ("limit", "parallel", "timeout"):
             if k in j and (not isinstance(j[k], int) or isinstance(j[k], bool) or j[k] < 0):
                 raise DevoError(f"job {j['name']}: {k} must be a whole number (JSON number, not a string)", code=1)
+        if j.get("parallel", 0) > MAX_PARALLEL:
+            print(f"# warning: job {j['name']}: parallel {j['parallel']} clamped to {MAX_PARALLEL}", file=sys.stderr)
+            j["parallel"] = MAX_PARALLEL
         for k in ("query", "from", "to", "chunk", "min_split"):
             if k in j and not isinstance(j[k], str):
                 raise DevoError(f"job {j['name']}: {k} must be a string", code=1)
@@ -3557,12 +3677,10 @@ def build_timeline(act_dir, tz=None, fm=None, families=None):
     for src in summary["sources"]:
         if src.get("error") or src.get("duplicate_of"):
             continue
-        path = src.get("file") or f"{src['source']}.jsonl"
-        if not os.path.exists(path):  # the directory was moved or copied: look next to summary.json
-            path = os.path.join(act_dir, os.path.basename(path))
-        if not os.path.exists(path):
+        path = inside_dir(act_dir, src.get("file") or f"{src['source']}.jsonl")  # next to summary.json only
+        if not path or not os.path.isfile(path):
             if src.get("rows"):
-                notes.append(f"{src['source']}: {os.path.basename(path)} is missing from {act_dir}")
+                notes.append(f"{src['source']}: {os.path.basename(path or '') or src.get('file')} is missing from {act_dir}")
             continue
         table, fam = src["table"], event_time_for(src["table"], families)
         role = field_roles(table, fm)
@@ -3711,7 +3829,13 @@ TEAMS_SLACK = 86400  # meeting records are created hours after the meeting: sear
 
 
 def linq_set(values):
-    return "{" + ", ".join(f'"{v}"' for v in sorted(values)) + "}"
+    return "{" + ", ".join(linq_str(v) for v in sorted(values)) + "}"
+
+
+def teams_subject_cond(oids, upns):
+    """The subject filter for `teams`: object ids and UPNs (taken from log data, so quoted with linq_str)."""
+    return " or ".join([f"message -> {linq_str(o)}" for o in sorted(oids)]
+                       + [f"weakhas(message, {linq_str(u)})" for u in sorted(upns)])
 
 
 def teams_select(where, extra=""):
@@ -4006,7 +4130,7 @@ def cmd_teams(cfg, a):
                             code=1)
         oids = {o for _, o, _ in accounts}
         upns = {u for u, _, _ in accounts}
-        cond = " or ".join([f'message -> "{o}"' for o in sorted(oids)] + [f'weakhas(message, "{u}")' for u in sorted(upns)])
+        cond = teams_subject_cond(oids, upns)
         linq = teams_select(f"({cond})")
         queries.append(linq)
         base, info = teams_pull(cfg, linq, frm_s, ing_to, a.timeout)
@@ -5220,7 +5344,7 @@ def creds_stage2(a):
               f"{r.get('properties_status_errorCode')}  {r.get('properties_appDisplayName') or ''}  "
               f"{(r.get('properties_userAgent') or '')[:40]}")
     if others and not stage3_ran:
-        q = ", ".join(json.dumps(u) for u in sorted(others)[:200])
+        q = ", ".join(linq_str(u) for u in sorted(others)[:200])
         out = os.path.join(s2, "stage3.jsonl")
         with open(out, "w", encoding="utf-8") as f:
             f.write(json.dumps({"name": "other_users_baseline", "from": "30d", "to": "now", "chunk": "1d", "parallel": 6,
@@ -5445,7 +5569,7 @@ def cmd_creds(cfg, a):
     ips = [x for x in dict.fromkeys(ips) if x not in egress][: a.max_ips]
     users = [u for u, _ in brute][:200] + [u for ip, e in spray for u in e["users"]][:200]
     users = list(dict.fromkeys(u for u in users if u))[:300]
-    q = lambda vals: ", ".join(json.dumps(v) for v in vals)
+    q = lambda vals: ", ".join(linq_str(v) for v in vals)
     jobs = []
     if ips:
         for t in ("cloud.azure.ad.signin", "cloud.azure.ad.noninteractive_user_signin"):
@@ -5808,6 +5932,31 @@ def cache_key(cfg, env=None):
     return f"{cfg['region']}-{digest}"
 
 
+def lock_file(f):
+    """Block until this process holds an exclusive lock on the open file f (fcntl on POSIX, msvcrt on Windows)."""
+    if WINDOWS:
+        import msvcrt
+        f.seek(0)
+        while True:
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)  # retries for ~10 s, then raises
+                return
+            except OSError:
+                continue
+    import fcntl
+    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+
+
+def unlock_file(f):
+    if WINDOWS:
+        import msvcrt
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
 class Cache:
     """One directory per domain, one JSON file per entry: {version, fetched, stale, data, ...}."""
 
@@ -5822,6 +5971,36 @@ class Cache:
             self.cap = float(cap) * DAY if cap else None
         except ValueError:
             raise DevoError(f"DEVO_CACHE_MAX_AGE_DAYS {cap!r} is not a number", code=1)
+        self._tlock = threading.RLock()
+        self._depth = 0
+        self._lockf = None
+
+    @contextlib.contextmanager
+    def lock(self):
+        """An advisory lock on <cache dir>/.lock around a read-modify-write, so helper processes that share
+        the cache (several at once under an MCP server, or a background `cache build`) don't lose each
+        other's changes. Re-entrant within a thread; single-entry writes don't need it (_write is atomic)."""
+        with self._tlock:
+            if self._depth == 0:
+                self.mkdirs(self.dir)
+                f = open(os.path.join(self.dir, ".lock"), "a+b")
+                try:
+                    lock_file(f)
+                except BaseException:
+                    f.close()
+                    raise
+                self._lockf = f
+            self._depth += 1
+            try:
+                yield self
+            finally:
+                self._depth -= 1
+                if self._depth == 0:
+                    f, self._lockf = self._lockf, None
+                    try:
+                        unlock_file(f)
+                    finally:
+                        f.close()
 
     def path(self, name):
         if not CACHE_NAME.match(name) or ".." in name:
@@ -5896,12 +6075,13 @@ class Cache:
 
     def invalidate(self, name, reason=""):
         """Mark an entry stale (kept as a fallback, refetched on next use). True if it changed."""
-        e = self.read(name)
-        if e is None or e.get("stale"):
-            return False
-        e.update(stale=True, stale_reason=reason)
-        self._write(name, e)
-        return True
+        with self.lock():
+            e = self.read(name)
+            if e is None or e.get("stale"):
+                return False
+            e.update(stale=True, stale_reason=reason)
+            self._write(name, e)
+            return True
 
     def drop(self, name):
         try:
@@ -5969,15 +6149,16 @@ def domain_tables(cfg, refresh=False, timeout=300):
         cache_say(f"live table list failed ({e}); using the cached copy")
         return [tuple(x) for x in old]
     if c:
-        before = cached_table_set()
-        old = c.read("tables") or {}
-        unq = set(old.get("unqueryable") or [])
-        if not refresh:  # keep tables known to be unqueryable out of an automatic refetch
-            rows = [r for r in rows if r[0] not in unq]
-        c.put("tables", rows, window=TABLES_WINDOW, unqueryable=sorted(unq) if not refresh else [])
-        if before is not None and before != {t for t, _ in rows}:
-            for n in ("sources", "event-time"):  # derived from the table list
-                c.invalidate(n, "table list changed")
+        with c.lock():
+            before = cached_table_set()
+            old = c.read("tables") or {}
+            unq = set(old.get("unqueryable") or [])
+            if not refresh:  # keep tables known to be unqueryable out of an automatic refetch
+                rows = [r for r in rows if r[0] not in unq]
+            c.put("tables", rows, window=TABLES_WINDOW, unqueryable=sorted(unq) if not refresh else [])
+            if before is not None and before != {t for t, _ in rows}:
+                for n in ("sources", "event-time"):  # derived from the table list
+                    c.invalidate(n, "table list changed")
     return [tuple(x) for x in rows]
 
 
@@ -6020,24 +6201,50 @@ def table_profile(cfg, table, refresh=False, sample=300, timeout=300):
     return prof
 
 
+def profile_signature(c):
+    """[[profile entry, mtime_ns, size]] of every cached profile: what a field map was built from."""
+    out = []
+    for n in c.names("fields/"):
+        try:
+            st = os.stat(c.path(n))
+        except OSError:
+            continue
+        out.append([n, st.st_mtime_ns, st.st_size])
+    return out
+
+
 def cached_field_map():
     """The merged field map (every cached profile, any age, with the curated roles applied), itself
-    cached as one file so `fields --role` and `timeline` don't read every profile each time."""
+    cached as one file so `fields --role` and `timeline` don't read every profile each time. It records
+    the profiles it was built from and is rebuilt when they differ, so a map written back by a reader
+    that started before a new profile landed doesn't hide that profile."""
     c = CACHE
     if not c:
         return {"tables": {}}
-    fm = c.get("field-map")
-    if fm is not None:
-        return fm
+    sig = profile_signature(c)
+    e = c.read("field-map")
+    if e is not None and c.state("field-map", e) == "fresh" and e.get("profiles") == sig:
+        return e["data"]
     tables = {}
-    for n in c.names("fields/"):
+    for n, _, _ in sig:
         d = c.get(n, allow_old=True)
         if d:
             tables[n.split("/", 1)[1]] = d
     fm = apply_roles({"tables": dict(sorted(tables.items()))}, FIELD_ROLES)
     if tables:
-        c.put("field-map", fm)
+        c.put("field-map", fm, profiles=sig)
     return fm
+
+
+def table_missing(cfg, table):
+    """True when the schema API answers 403/404 for the table (Devo's answer for one that doesn't exist).
+    Any other failure means we can't tell, so False."""
+    url = f"https://{REGIONS[cfg['region']][0]}/search/table/{urllib.parse.quote(table, safe='.')}"
+    try:
+        get_json(url, cfg["token"])
+    except DevoError as e:
+        return bool(re.search(r"HTTP (403|404)\b", str(e)))
+    return False
 
 
 def cache_mismatch(linq, err, cfg=None):
@@ -6048,19 +6255,28 @@ def cache_mismatch(linq, err, cfg=None):
         return
     msg = str(err)
     low = msg.lower()
-    tabs = re.findall(r"\bfrom\s+`?([A-Za-z0-9_.-]+)`?", linq)
+    tabs = re.findall(r"\bfrom\s+`?([A-Za-z0-9_.-]+)`?", blank_strings(linq))
     if "unknown table" in low or "access not allowed for table" in low:
-        bad = [t for t in tabs if t in (cached_table_set() or set())]
-        if bad:
-            # the collector counter can list a table that isn't queryable: drop it from the cached list
-            # and remember it, rather than refetching a list that would only bring it back
+        # only the table the message names, only if the query reads it, and only once the schema API
+        # agrees: a wrong mark hides a real table from coverage/lag/activity for everyone on this cache
+        m = re.search(r"(?:unknown table|access not allowed for table)\W+([A-Za-z0-9_.-]+)", msg, re.I)
+        bad = m.group(1) if m else None
+        if not bad or not cfg or bad not in tabs or bad not in (cached_table_set() or set()):
+            return
+        if not table_missing(cfg, bad):
+            return
+        # the collector counter can list a table that isn't queryable: drop it from the cached list
+        # and remember it, rather than refetching a list that would only bring it back
+        with c.lock():
             e = c.read("tables")
-            gone = set(e.get("unqueryable") or []) | set(bad)
+            if e is None:
+                return
+            gone = set(e.get("unqueryable") or []) | {bad}
             c.put("tables", [r for r in e["data"] if r[0] not in gone], window=e.get("window"),
                   unqueryable=sorted(gone))
-            c.invalidate("sources", f"{bad[0]} isn't queryable")
-            cache_say(f"{bad[0]} is listed by the collector counter but Devo says it doesn't exist: dropped from "
-                      "the cached table list (`tables --live` refetches the list)", noisy=True)
+            c.invalidate("sources", f"{bad} isn't queryable")
+        cache_say(f"{bad} is listed by the collector counter but Devo says it doesn't exist: dropped from "
+                  "the cached table list (`tables --live` refetches the list)", noisy=True)
     elif "unknown identifier" in low:
         m = re.search(r"identifier\W+`?([A-Za-z_]\w*)", msg, re.I)
         if not m:
@@ -6332,6 +6548,79 @@ def print_cache_status(s):
       + f"; naming {n['naming']}")
 
 
+def cache_edit_notes(act, what):
+    """`cache note|service|naming`: edit the notes entry. The caller holds the cache lock."""
+    if act == "note":
+        d = load_notes()
+        if not what:
+            raise DevoError("cache note add TEXT | verify ID | rm ID", code=1)
+        sub, rest = what[0], what[1:]
+        now = int(time.time())
+        if sub == "add":
+            text = " ".join(rest).strip()
+            if not text:
+                raise DevoError("cache note add needs the note text", code=1)
+            nid = max([x["id"] for x in d["notes"]] + [0]) + 1
+            d["notes"].append({"id": nid, "text": text, "added": now, "verified": now})
+            save_notes(d)
+            print(f"note {nid} added")
+            return 0
+        if sub in ("verify", "rm") and rest:
+            ids = {int(x) for x in rest if x.isdigit()}
+            hit = [x for x in d["notes"] if x["id"] in ids]
+            if not hit:
+                raise DevoError(f"no note with id {', '.join(rest)}", "list them with `devo.py cache notes`", code=1)
+            if sub == "rm":
+                d["notes"] = [x for x in d["notes"] if x["id"] not in ids]
+            else:
+                for x in hit:
+                    x["verified"] = now
+            save_notes(d)
+            print(f"{'removed' if sub == 'rm' else 're-verified'} {len(hit)} note(s)")
+            return 0
+        raise DevoError("cache note add TEXT | verify ID | rm ID", code=1)
+    if act == "service":
+        d = load_notes()
+        if not what or what[0] == "show":
+            print(", ".join(d.get("service_accounts") or []) or "(none recorded)")
+            return 0
+        if what[0] == "reset":
+            d["service_accounts"] = []
+        elif what[0] in ("set", "add") and len(what) > 1:
+            new_ = [x.strip() for x in ",".join(what[1:]).split(",") if x.strip()]
+            bad = [x for x in new_ if not re.fullmatch(r"[A-Za-z0-9_.@$*?\-\[\]]+", x)]
+            if bad:
+                raise DevoError(f"service pattern {bad[0]!r}: use account-name globs like svc-*, ec2-user", code=1)
+            d["service_accounts"] = list(dict.fromkeys(((d.get("service_accounts") or []) if what[0] == "add" else [])
+                                                       + new_))
+        else:
+            raise DevoError("cache service show | set GLOB[,GLOB...] | add GLOB[,...] | reset", code=1)
+        save_notes(d)
+        print("service accounts: " + (", ".join(d["service_accounts"]) or "(none)"))
+        return 0
+    if act == "naming":
+        d = load_notes()
+        if not what or what[0] == "show":
+            print(", ".join(naming_templates()) + ("" if d.get("naming") else "  (default)"))
+            return 0
+        if what[0] == "reset":
+            d["naming"] = None
+        elif what[0] == "set" and len(what) > 1:
+            tpl = [x.strip() for x in ",".join(what[1:]).split(",") if x.strip()]
+            for x in tpl:
+                bad = set(re.findall(r"\{(\w*)\}", x)) - {"upn", "local", "first", "last", "f", "l"}
+                if bad or not re.fullmatch(r"[A-Za-z0-9_.@$\-{}]+", x):
+                    raise DevoError(f"naming template {x!r}: use {{upn}} {{local}} {{first}} {{last}} {{f}} {{l}} "
+                                    "and letters, digits, . _ @ $ -", code=1)
+            d["naming"] = tpl
+        else:
+            raise DevoError("cache naming show | set TEMPLATE[,TEMPLATE...] | reset", code=1)
+        save_notes(d)
+        print("naming: " + ", ".join(naming_templates()))
+        return 0
+    raise DevoError(f"unknown cache action {act!r}", code=1)
+
+
 def cmd_cache(cfg, a):
     from concurrent.futures import ThreadPoolExecutor
     c = CACHE
@@ -6487,74 +6776,9 @@ def cmd_cache(cfg, a):
         print(f"# {len(d['notes'])} notes; naming {d.get('naming') or 'default ' + str(DEFAULT_NAMING)}",
               file=sys.stderr)
         return 0
-    if act == "note":
-        d = load_notes()
-        if not what:
-            raise DevoError("cache note add TEXT | verify ID | rm ID", code=1)
-        sub, rest = what[0], what[1:]
-        now = int(time.time())
-        if sub == "add":
-            text = " ".join(rest).strip()
-            if not text:
-                raise DevoError("cache note add needs the note text", code=1)
-            nid = max([x["id"] for x in d["notes"]] + [0]) + 1
-            d["notes"].append({"id": nid, "text": text, "added": now, "verified": now})
-            save_notes(d)
-            print(f"note {nid} added")
-            return 0
-        if sub in ("verify", "rm") and rest:
-            ids = {int(x) for x in rest if x.isdigit()}
-            hit = [x for x in d["notes"] if x["id"] in ids]
-            if not hit:
-                raise DevoError(f"no note with id {', '.join(rest)}", "list them with `devo.py cache notes`", code=1)
-            if sub == "rm":
-                d["notes"] = [x for x in d["notes"] if x["id"] not in ids]
-            else:
-                for x in hit:
-                    x["verified"] = now
-            save_notes(d)
-            print(f"{'removed' if sub == 'rm' else 're-verified'} {len(hit)} note(s)")
-            return 0
-        raise DevoError("cache note add TEXT | verify ID | rm ID", code=1)
-    if act == "service":
-        d = load_notes()
-        if not what or what[0] == "show":
-            print(", ".join(d.get("service_accounts") or []) or "(none recorded)")
-            return 0
-        if what[0] == "reset":
-            d["service_accounts"] = []
-        elif what[0] in ("set", "add") and len(what) > 1:
-            new_ = [x.strip() for x in ",".join(what[1:]).split(",") if x.strip()]
-            bad = [x for x in new_ if not re.fullmatch(r"[A-Za-z0-9_.@$*?\-\[\]]+", x)]
-            if bad:
-                raise DevoError(f"service pattern {bad[0]!r}: use account-name globs like svc-*, ec2-user", code=1)
-            d["service_accounts"] = list(dict.fromkeys(((d.get("service_accounts") or []) if what[0] == "add" else [])
-                                                       + new_))
-        else:
-            raise DevoError("cache service show | set GLOB[,GLOB...] | add GLOB[,...] | reset", code=1)
-        save_notes(d)
-        print("service accounts: " + (", ".join(d["service_accounts"]) or "(none)"))
-        return 0
-    if act == "naming":
-        d = load_notes()
-        if not what or what[0] == "show":
-            print(", ".join(naming_templates()) + ("" if d.get("naming") else "  (default)"))
-            return 0
-        if what[0] == "reset":
-            d["naming"] = None
-        elif what[0] == "set" and len(what) > 1:
-            tpl = [x.strip() for x in ",".join(what[1:]).split(",") if x.strip()]
-            for x in tpl:
-                bad = set(re.findall(r"\{(\w*)\}", x)) - {"upn", "local", "first", "last", "f", "l"}
-                if bad or not re.fullmatch(r"[A-Za-z0-9_.@$\-{}]+", x):
-                    raise DevoError(f"naming template {x!r}: use {{upn}} {{local}} {{first}} {{last}} {{f}} {{l}} "
-                                    "and letters, digits, . _ @ $ -", code=1)
-            d["naming"] = tpl
-        else:
-            raise DevoError("cache naming show | set TEMPLATE[,TEMPLATE...] | reset", code=1)
-        save_notes(d)
-        print("naming: " + ", ".join(naming_templates()))
-        return 0
+    if act in ("note", "service", "naming"):
+        with c.lock():  # read-modify-write of the notes entry: two `note add` at once must not share an id
+            return cache_edit_notes(act, what)
     raise DevoError(f"unknown cache action {act!r}", code=1)
 
 
@@ -6584,7 +6808,8 @@ def build_parser():
     s.add_argument("linq")
     s.add_argument("--from", dest="from_", default="1h", help="start (default 1h = one hour ago)")
     s.add_argument("--to", default="now", help="end (default now)")
-    s.add_argument("--limit", type=int, default=200, help="max rows (default 200; 0 = no limit, careful)")
+    s.add_argument("--limit", type=int, default=200, help="max rows per window (default 200; 0 = no limit, careful). With --chunk or "
+                   "auto-split each window has its own limit, so the total can be many times it")
     s.add_argument("--format", choices=fmts, default="table")
     s.add_argument("--sort", help="client-side sort of the returned rows: --sort=field or --sort=-field (desc), "
                                   "comma-separated (LINQ has no ORDER BY)")
@@ -7005,6 +7230,9 @@ def main(argv=None):
         return 130
     except BrokenPipeError:
         return 0
+    except Exception as e:  # a bug or input nothing above anticipated: one line, not a traceback
+        print(f"ERROR: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
 
 
 def utf8_stdio():

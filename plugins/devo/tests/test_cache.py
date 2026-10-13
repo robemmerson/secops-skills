@@ -112,7 +112,8 @@ class MismatchTests(CacheCase):
     def test_unknown_table_is_dropped_from_the_list(self):
         self.cache.put("tables", [["t.gone", 5], ["t.ok", 3]])
         self.cache.put("sources", {"sources": []})
-        devo.cache_mismatch("from t.gone select *", devo.DevoError("Unknown table `t.gone`"))
+        with mock.patch.object(devo, "table_missing", return_value=True):  # the schema API agrees
+            devo.cache_mismatch("from t.gone select *", devo.DevoError("Unknown table `t.gone`"), CFG)
         self.assertEqual(self.cache.get("tables"), [["t.ok", 3]])
         self.assertEqual(self.cache.read("tables")["unqueryable"], ["t.gone"])
         self.assertEqual(self.cache.state("sources"), "stale")
@@ -139,7 +140,8 @@ class MismatchTests(CacheCase):
 
     def test_collect_reports_the_mismatch(self):
         self.cache.put("tables", [["t.gone", 5]])
-        with mock.patch.object(devo, "run_query", side_effect=devo.DevoError("Unknown table `t.gone`")):
+        with mock.patch.object(devo, "run_query", side_effect=devo.DevoError("Unknown table `t.gone`")), \
+                mock.patch.object(devo, "table_missing", return_value=True):
             with self.assertRaises(devo.DevoError):
                 devo.collect(CFG, "from t.gone select *", 0, 1, 10, 10)
         self.assertEqual(self.cache.get("tables"), [])

@@ -70,7 +70,7 @@ def run_cli(argv, responses):
         return r
 
     out, err = io.StringIO(), io.StringIO()
-    with mock.patch.object(devo.urllib.request, "urlopen", fake_urlopen), \
+    with mock.patch.object(devo.OPENER, "open", fake_urlopen), \
             mock.patch.object(devo, "load_config", lambda: dict(CFG)), \
             mock.patch.object(devo.time, "time", lambda: NOW), \
             mock.patch.object(devo, "RETRY_DELAY", 0), \
@@ -523,7 +523,7 @@ def run_routed(argv, route):
         return FakeResp(r, chunk=4096)
 
     out, err = io.StringIO(), io.StringIO()
-    with mock.patch.object(devo.urllib.request, "urlopen", fake_urlopen), \
+    with mock.patch.object(devo.OPENER, "open", fake_urlopen), \
             mock.patch.object(devo, "load_config", lambda: dict(CFG)), \
             mock.patch.object(devo.time, "time", lambda: NOW), \
             mock.patch.object(devo, "RETRY_DELAY", 0), \
