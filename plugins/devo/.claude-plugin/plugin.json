@@ -6,5 +6,6 @@
     "name": "Rob Emmerson",
     "url": "https://github.com/robemmerson"
   },
-  "repository": "https://github.com/robemmerson/secops-skills"
+  "repository": "https://github.com/robemmerson/secops-skills",
+  "license": "MIT"
 }

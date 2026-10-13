@@ -51,6 +51,8 @@ tools/
   ci.yml                            validate, unit tests, zip dry-run, gitleaks
   release.yml                       auto-version, tag, GitHub release with zips
 .github/dependabot.yml              weekly SHA-pinned Actions bumps, 3-day cooldown
+LICENSE                             MIT, for this project's own code and writing
+THIRD_PARTY.md                      Devo documentation reproduced in the Devo skill, and its terms
 ```
 
 ## Versioning and releases (automatic)
@@ -101,3 +103,8 @@ skill's base directory, which Claude sees when the skill loads.
 - No environment data either: skills ship generic knowledge only. The Devo skill learns each
   domain at runtime and caches what it learns on the user's machine (see
   [`plugins/devo`](plugins/devo/)).
+
+## Licence
+
+[MIT](LICENSE). The detection library, table catalogue and union-table reference in the Devo
+skill come from Devo's documentation and stay under Devo's terms: see [THIRD_PARTY.md](THIRD_PARTY.md).
